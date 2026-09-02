@@ -19,7 +19,9 @@ jobs:
           java-version: '17'
 
       - name: Install dependencies
-        run: npm install
+        run: |
+          npm install @capacitor/core @capacitor/android @capacitor/splash-screen
+          npm install -D @capacitor/cli
 
       - name: Add Android platform
         run: npx cap add android
@@ -27,11 +29,205 @@ jobs:
       - name: Sync Capacitor
         run: npx cap sync android
 
-      - name: Add screenshot-block (FLAG_SECURE)
+      - name: Write full MainActivity.java (35+ native features)
         run: |
           FILE=$(find android -name MainActivity.java)
-          sed -i 's/import com.getcapacitor.BridgeActivity;/import com.getcapacitor.BridgeActivity;\nimport android.view.WindowManager;/' "$FILE"
-          sed -i 's/super.onCreate(savedInstanceState);/super.onCreate(savedInstanceState);\n        getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);/' "$FILE"
+          PKG_LINE=$(head -n 1 "$FILE")
+          cat > "$FILE" << JAVAEOF
+          $PKG_LINE
+
+          import android.content.Context;
+          import android.net.ConnectivityManager;
+          import android.net.NetworkInfo;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Vibrator;
+          import android.os.VibrationEffect;
+          import android.view.WindowManager;
+          import android.webkit.CookieManager;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.widget.Toast;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+
+              private boolean doubleBackToExitPressedOnce = false;
+              private final Handler exitHandler = new Handler();
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  // 1-2: Screenshot + screen recording block
+                  getWindow().setFlags(
+                      WindowManager.LayoutParams.FLAG_SECURE,
+                      WindowManager.LayoutParams.FLAG_SECURE
+                  );
+                  // 3: Keep screen on
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+                  WebView webView = this.bridge.getWebView();
+                  WebSettings settings = webView.getSettings();
+
+                  // 4-5: Zoom disable
+                  settings.setSupportZoom(false);
+                  settings.setBuiltInZoomControls(false);
+                  settings.setDisplayZoomControls(false);
+
+                  // 6-7: Storage + JS
+                  settings.setDomStorageEnabled(true);
+                  settings.setJavaScriptEnabled(true);
+
+                  // 8: Cache
+                  settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+
+                  // 9: Mixed content block (HTTPS only)
+                  settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+
+                  // 10: Custom user agent
+                  String ua = settings.getUserAgentString();
+                  settings.setUserAgentString(ua + " RealVisionApp/1.0");
+
+                  // 11-12: Long-press / text-select disable
+                  webView.setLongClickable(false);
+                  webView.setHapticFeedbackEnabled(false);
+                  webView.setOnLongClickListener(v -> true);
+
+                  // 13: Overscroll/bounce disable
+                  webView.setOverScrollMode(WebView.OVER_SCROLL_NEVER);
+
+                  // 14: Text zoom lock
+                  settings.setTextZoom(100);
+
+                  // 15: Cookies persist
+                  CookieManager.getInstance().setAcceptCookie(true);
+                  CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
+
+                  // 16: Disable WebView debugging in production
+                  WebView.setWebContentsDebuggingEnabled(false);
+
+                  // 17: Safe browsing
+                  settings.setSafeBrowsingEnabled(true);
+
+                  // 18: Render priority
+                  settings.setRenderPriority(WebSettings.RenderPriority.HIGH);
+
+                  // 19-20: Root / USB-debug detection warning
+                  if (isRooted()) {
+                      Toast.makeText(this, "ማስጠንቀቂያ፡ ስልኩ root የተደረገ ነው", Toast.LENGTH_LONG).show();
+                  }
+                  if (isUsbDebuggingOn()) {
+                      Toast.makeText(this, "ማስጠንቀቂያ፡ USB Debugging በርቷል", Toast.LENGTH_LONG).show();
+                  }
+
+                  // 21: Network check + bilingual toast
+                  if (!isNetworkAvailable()) {
+                      Toast.makeText(this, "የኢንተርኔት ግንኙነት የለም / No internet connection", Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              // 22-23: Double-back-to-exit + WebView history back
+              @Override
+              public void onBackPressed() {
+                  WebView webView = this.bridge.getWebView();
+                  if (webView.canGoBack()) {
+                      webView.goBack();
+                      return;
+                  }
+                  if (doubleBackToExitPressedOnce) {
+                      super.onBackPressed();
+                      return;
+                  }
+                  this.doubleBackToExitPressedOnce = true;
+                  Toast.makeText(this, "ለመውጣት ደግመው ይንኩ / Tap again to exit", Toast.LENGTH_SHORT).show();
+                  vibrateShort();
+                  exitHandler.postDelayed(() -> doubleBackToExitPressedOnce = false, 2000);
+              }
+
+              // 24: Vibration feedback
+              private void vibrateShort() {
+                  Vibrator v = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+                  if (v == null) return;
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      v.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE));
+                  } else {
+                      v.vibrate(50);
+                  }
+              }
+
+              // 25: Network check helper
+              private boolean isNetworkAvailable() {
+                  ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                  NetworkInfo activeNetwork = cm != null ? cm.getActiveNetworkInfo() : null;
+                  return activeNetwork != null && activeNetwork.isConnectedOrConnecting();
+              }
+
+              // 26: Root detection helper
+              private boolean isRooted() {
+                  String[] paths = {
+                      "/system/app/Superuser.apk", "/sbin/su", "/system/bin/su",
+                      "/system/xbin/su", "/data/local/xbin/su", "/data/local/bin/su",
+                      "/system/sd/xbin/su", "/system/bin/failsafe/su", "/data/local/su"
+                  };
+                  for (String path : paths) {
+                      if (new java.io.File(path).exists()) return true;
+                  }
+                  return false;
+              }
+
+              // 27: USB debugging detection helper
+              private boolean isUsbDebuggingOn() {
+                  return android.provider.Settings.Secure.getInt(
+                      getContentResolver(),
+                      android.provider.Settings.Global.ADB_ENABLED, 0) == 1;
+              }
+          }
+          JAVAEOF
+
+      - name: Update AndroidManifest (orientation, keyboard, permissions, deep link)
+        run: |
+          python3 << 'PYEOF'
+          import re
+
+          path = "android/app/src/main/AndroidManifest.xml"
+          with open(path) as f:
+              content = f.read()
+
+          # 28-29: Force portrait + keyboard resize on the main activity
+          content = content.replace(
+              '<activity',
+              '<activity\n            android:screenOrientation="portrait"\n            android:windowSoftInputMode="adjustResize"',
+              1
+          )
+
+          # 30: VIBRATE permission
+          if 'android.permission.VIBRATE' not in content:
+              content = content.replace(
+                  '<application',
+                  '<uses-permission android:name="android.permission.VIBRATE" />\n    <application',
+                  1
+              )
+
+          # 31: Deep link intent-filter (web+realvision://) inserted before closing </activity> (first one)
+          deep_link_filter = '''        <intent-filter>
+              <action android:name="android.intent.action.VIEW" />
+              <category android:name="android.intent.category.DEFAULT" />
+              <category android:name="android.intent.category.BROWSABLE" />
+              <data android:scheme="web+realvision" />
+          </intent-filter>
+      </activity>'''
+          content = content.replace('</activity>', deep_link_filter, 1)
+
+          with open(path, 'w') as f:
+              f.write(content)
+          PYEOF
+
+      - name: Update styles.xml (status/nav bar colors)
+        run: |
+          FILE=android/app/src/main/res/values/styles.xml
+          sed -i 's/<\/style>/    <item name="android:statusBarColor">#0b0518<\/item>\n        <item name="android:navigationBarColor">#0b0518<\/item>\n        <item name="android:windowBackground">#0b0518<\/item>\n    <\/style>/' "$FILE"
 
       - name: Build Debug APK
         run: |
