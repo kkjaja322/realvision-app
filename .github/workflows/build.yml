@@ -36,25 +36,59 @@ jobs:
           cat > "$FILE" << JAVAEOF
           $PKG_LINE
 
+          import android.app.AlertDialog;
           import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageInfo;
+          import android.graphics.Color;
           import android.net.ConnectivityManager;
+          import android.net.Network;
+          import android.net.NetworkCapabilities;
           import android.net.NetworkInfo;
+          import android.net.NetworkRequest;
+          import android.net.Uri;
+          import android.provider.Settings;
           import android.os.Build;
           import android.os.Bundle;
           import android.os.Handler;
+          import android.os.Looper;
           import android.os.Vibrator;
           import android.os.VibrationEffect;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
           import android.view.WindowManager;
           import android.webkit.CookieManager;
+          import android.webkit.JavascriptInterface;
           import android.webkit.WebSettings;
           import android.webkit.WebView;
+          import android.widget.FrameLayout;
+          import android.widget.TextView;
           import android.widget.Toast;
           import com.getcapacitor.BridgeActivity;
+          import org.json.JSONObject;
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
 
           public class MainActivity extends BridgeActivity {
 
               private boolean doubleBackToExitPressedOnce = false;
               private final Handler exitHandler = new Handler();
+              private final Handler bannerHandler = new Handler(Looper.getMainLooper());
+              private TextView networkBanner;
+              private ConnectivityManager.NetworkCallback networkCallback;
+              private final Handler connectivityHandler = new Handler(Looper.getMainLooper());
+              private boolean vpnDialogShowing = false;
+              private final Runnable periodicConnectivityCheck = new Runnable() {
+                  @Override
+                  public void run() {
+                      checkRealInternet();
+                      connectivityHandler.postDelayed(this, 10000);
+                  }
+              };
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
@@ -115,6 +149,9 @@ jobs:
 
                           // 18: Render priority
                           settings.setRenderPriority(WebSettings.RenderPriority.HIGH);
+
+                          // 35: Native share bridge — call from web page via AndroidShare.shareText("...")
+                          webView.addJavascriptInterface(new WebAppInterface(), "AndroidShare");
                       }
 
                       // 19-20: Root / USB-debug detection warning
@@ -124,14 +161,189 @@ jobs:
                       if (isUsbDebuggingOn()) {
                           Toast.makeText(this, "ማስጠንቀቂያ፡ USB Debugging በርቷል", Toast.LENGTH_LONG).show();
                       }
+                      // 36: Emulator detection warning
+                      if (isEmulator()) {
+                          Toast.makeText(this, "ማስጠንቀቂያ፡ emulator ላይ እየሮጠ ነው", Toast.LENGTH_LONG).show();
+                      }
 
                       // 21: Network check + bilingual toast
                       if (!isNetworkAvailable()) {
                           Toast.makeText(this, "የኢንተርኔት ግንኙነት የለም / No internet connection", Toast.LENGTH_LONG).show();
                       }
+
+                      // 32: Telegram-style network status banner
+                      setupNetworkBanner();
+
+                      // 33: Real-internet (package/data) check, polled periodically
+                      connectivityHandler.post(periodicConnectivityCheck);
+
+                      // 34: VPN detection on launch
+                      checkVpnAndPrompt();
+
+                      // 37: Force-update check against remote version JSON
+                      checkForForceUpdate();
+
+                      // 38: App-rating prompt after a few launches
+                      maybePromptRating();
                   } catch (Exception e) {
                       e.printStackTrace();
                   }
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  try {
+                      // 34a: Re-check VPN when returning from Settings
+                      checkVpnAndPrompt();
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  try {
+                      if (networkCallback != null) {
+                          ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                          if (cm != null) cm.unregisterNetworkCallback(networkCallback);
+                      }
+                      connectivityHandler.removeCallbacks(periodicConnectivityCheck);
+                  } catch (Exception e) {
+                      // ignore
+                  }
+              }
+
+              // 32a: Sets up a top banner that mimics Telegram's connection status text
+              private void setupNetworkBanner() {
+                  networkBanner = new TextView(this);
+                  networkBanner.setTextColor(Color.WHITE);
+                  networkBanner.setTextSize(13);
+                  networkBanner.setGravity(Gravity.CENTER);
+                  networkBanner.setBackgroundColor(Color.parseColor("#2b2140"));
+                  networkBanner.setPadding(0, 20, 0, 20);
+                  networkBanner.setVisibility(View.GONE);
+
+                  FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT,
+                      ViewGroup.LayoutParams.WRAP_CONTENT
+                  );
+                  params.gravity = Gravity.TOP;
+                  addContentView(networkBanner, params);
+
+                  ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                  if (cm == null) return;
+
+                  NetworkRequest request = new NetworkRequest.Builder().build();
+                  networkCallback = new ConnectivityManager.NetworkCallback() {
+                      @Override
+                      public void onLost(Network network) {
+                          runOnUiThread(() -> setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true));
+                      }
+
+                      @Override
+                      public void onUnavailable() {
+                          runOnUiThread(() -> setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true));
+                      }
+
+                      @Override
+                      public void onAvailable(Network network) {
+                          runOnUiThread(() -> {
+                              setBanner("Connecting...", true);
+                              bannerHandler.postDelayed(() -> {
+                                  setBanner("Updating...", true);
+                                  WebView webView = bridge != null ? bridge.getWebView() : null;
+                                  if (webView != null) webView.reload();
+                                  bannerHandler.postDelayed(() -> checkRealInternet(), 1200);
+                              }, 800);
+                          });
+                      }
+                  };
+
+                  cm.registerNetworkCallback(request, networkCallback);
+              }
+
+              private void setBanner(String text, boolean visible) {
+                  if (networkBanner == null) return;
+                  if (text != null) networkBanner.setText(text);
+                  networkBanner.setVisibility(visible ? View.VISIBLE : View.GONE);
+              }
+
+              // 33a: Confirms whether the connected network actually reaches the internet
+              // (as opposed to just being "connected" per Android, which is also true when
+              // the SIM's data package/balance has run out). Does this by quickly attempting
+              // a socket connection to google.com; it cannot read the phone's data balance
+              // directly, so this is only a proxy signal for "no real internet", which is the
+              // most common cause of that condition.
+              private void checkRealInternet() {
+                  if (!isNetworkAvailable()) {
+                      runOnUiThread(() -> setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true));
+                      return;
+                  }
+                  new Thread(() -> {
+                      boolean hasRealInternet;
+                      try {
+                          java.net.Socket socket = new java.net.Socket();
+                          socket.connect(new java.net.InetSocketAddress("google.com", 443), 2500);
+                          socket.close();
+                          hasRealInternet = true;
+                      } catch (Exception e) {
+                          hasRealInternet = false;
+                      }
+                      final boolean result = hasRealInternet;
+                      runOnUiThread(() -> {
+                          if (!isNetworkAvailable()) {
+                              setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true);
+                          } else if (!result) {
+                              setBanner("YOU ARE ONLINE BUT CHECK YOUR PACKAGE!", true);
+                          } else {
+                              setBanner(null, false);
+                          }
+                      });
+                  }).start();
+              }
+
+              // 34a: Detects an active VPN connection and, if found, shows a blocking dialog.
+              private boolean isVpnActive() {
+                  try {
+                      ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                      if (cm == null) return false;
+                      Network network = cm.getActiveNetwork();
+                      if (network == null) return false;
+                      NetworkCapabilities capabilities = cm.getNetworkCapabilities(network);
+                      return capabilities != null && capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN);
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+
+              private void checkVpnAndPrompt() {
+                  if (vpnDialogShowing || isFinishing()) return;
+                  if (isVpnActive()) {
+                      showVpnDialog();
+                  }
+              }
+
+              private void showVpnDialog() {
+                  vpnDialogShowing = true;
+                  new AlertDialog.Builder(this)
+                      .setTitle("VPN Detected")
+                      .setMessage("VPN ተገኝቷል። ይህን መተግበሪያ ለመጠቀም እባክዎ VPN ን ያጥፉ።\nA VPN was detected. Please disable it to use this app.\n\nOpen VPN settings now?")
+                      .setCancelable(false)
+                      .setPositiveButton("Yes", (dialog, which) -> {
+                          vpnDialogShowing = false;
+                          try {
+                              startActivity(new Intent(Settings.ACTION_VPN_SETTINGS));
+                          } catch (Exception e) {
+                              e.printStackTrace();
+                          }
+                      })
+                      .setNegativeButton("No", (dialog, which) -> {
+                          vpnDialogShowing = false;
+                          finish();
+                      })
+                      .show();
               }
 
               // 22-23: Double-back-to-exit + WebView history back
@@ -203,6 +415,138 @@ jobs:
                           android.provider.Settings.Global.ADB_ENABLED, 0) == 1;
                   } catch (Exception e) {
                       return false;
+                  }
+              }
+
+              // 36a: Emulator detection helper
+              private boolean isEmulator() {
+                  try {
+                      return Build.FINGERPRINT.startsWith("generic")
+                          || Build.FINGERPRINT.startsWith("unknown")
+                          || Build.MODEL.contains("google_sdk")
+                          || Build.MODEL.contains("Emulator")
+                          || Build.MODEL.contains("Android SDK built for x86")
+                          || Build.MANUFACTURER.contains("Genymotion")
+                          || (Build.BRAND.startsWith("generic") && Build.DEVICE.startsWith("generic"))
+                          || "google_sdk".equals(Build.PRODUCT);
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+
+              // 37a: TODO — replace with your real hosted JSON, e.g.:
+              // {"latestVersionCode": 3, "forceUpdate": true, "playStoreUrl": "https://play.google.com/store/apps/details?id=..."}
+              private static final String UPDATE_CHECK_URL = "https://example.com/realvision-version.json";
+
+              private void checkForForceUpdate() {
+                  new Thread(() -> {
+                      try {
+                          URL url = new URL(UPDATE_CHECK_URL);
+                          HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                          conn.setConnectTimeout(4000);
+                          conn.setReadTimeout(4000);
+                          BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                          StringBuilder sb = new StringBuilder();
+                          String line;
+                          while ((line = reader.readLine()) != null) sb.append(line);
+                          reader.close();
+
+                          JSONObject json = new JSONObject(sb.toString());
+                          int latestVersionCode = json.optInt("latestVersionCode", -1);
+                          boolean forceUpdate = json.optBoolean("forceUpdate", false);
+                          String storeUrl = json.optString(
+                              "playStoreUrl",
+                              "https://play.google.com/store/apps/details?id=" + getPackageName()
+                          );
+                          int currentVersionCode = getVersionCode();
+
+                          if (forceUpdate && latestVersionCode > currentVersionCode) {
+                              runOnUiThread(() -> showForceUpdateDialog(storeUrl));
+                          }
+                      } catch (Exception e) {
+                          e.printStackTrace();
+                      }
+                  }).start();
+              }
+
+              private int getVersionCode() {
+                  try {
+                      PackageInfo pInfo = getPackageManager().getPackageInfo(getPackageName(), 0);
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                          return (int) pInfo.getLongVersionCode();
+                      }
+                      return pInfo.versionCode;
+                  } catch (Exception e) {
+                      return -1;
+                  }
+              }
+
+              private void showForceUpdateDialog(String storeUrl) {
+                  if (isFinishing()) return;
+                  new AlertDialog.Builder(this)
+                      .setTitle("Update Required / ማሻሻያ ያስፈልጋል")
+                      .setMessage("አዲስ ስሪት አለ፣ ለመቀጠል እባክዎ ያዘምኑ።\nA new version is available. Please update to continue.")
+                      .setCancelable(false)
+                      .setPositiveButton("Update", (dialog, which) -> {
+                          try {
+                              startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(storeUrl)));
+                          } catch (Exception e) {
+                              e.printStackTrace();
+                          }
+                          finish();
+                      })
+                      .show();
+              }
+
+              // 38a: Prompts for a Play Store rating after the 5th launch, once only
+              private void maybePromptRating() {
+                  try {
+                      SharedPreferences prefs = getSharedPreferences("realvision_prefs", MODE_PRIVATE);
+                      int launches = prefs.getInt("launch_count", 0) + 1;
+                      prefs.edit().putInt("launch_count", launches).apply();
+
+                      boolean alreadyHandled = prefs.getBoolean("rated_or_dismissed", false);
+                      if (!alreadyHandled && launches == 5) {
+                          showRatingDialog(prefs);
+                      }
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+              }
+
+              private void showRatingDialog(SharedPreferences prefs) {
+                  if (isFinishing()) return;
+                  new AlertDialog.Builder(this)
+                      .setTitle("Enjoying the app? / መተግበሪያውን ወደዱት?")
+                      .setMessage("Play Store ላይ 5 ኮከብ ቢሰጡን ደስ ይለናል!\nWe'd love a 5-star rating on the Play Store!")
+                      .setPositiveButton("Rate Now", (dialog, which) -> {
+                          prefs.edit().putBoolean("rated_or_dismissed", true).apply();
+                          try {
+                              startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=" + getPackageName())));
+                          } catch (Exception e) {
+                              startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=" + getPackageName())));
+                          }
+                      })
+                      .setNegativeButton("Later", (dialog, which) -> {
+                          prefs.edit().putBoolean("rated_or_dismissed", true).apply();
+                      })
+                      .show();
+              }
+
+              // 35a: Native share, callable from the web page as: AndroidShare.shareText("some text")
+              private class WebAppInterface {
+                  @JavascriptInterface
+                  public void shareText(String text) {
+                      runOnUiThread(() -> {
+                          try {
+                              Intent shareIntent = new Intent(Intent.ACTION_SEND);
+                              shareIntent.setType("text/plain");
+                              shareIntent.putExtra(Intent.EXTRA_TEXT, text);
+                              startActivity(Intent.createChooser(shareIntent, "Share via"));
+                          } catch (Exception e) {
+                              e.printStackTrace();
+                          }
+                      });
                   }
               }
           }
