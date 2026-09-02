@@ -60,71 +60,77 @@ jobs:
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
 
-                  // 1-2: Screenshot + screen recording block
-                  getWindow().setFlags(
-                      WindowManager.LayoutParams.FLAG_SECURE,
-                      WindowManager.LayoutParams.FLAG_SECURE
-                  );
-                  // 3: Keep screen on
-                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  try {
+                      // 1-2: Screenshot + screen recording block
+                      getWindow().setFlags(
+                          WindowManager.LayoutParams.FLAG_SECURE,
+                          WindowManager.LayoutParams.FLAG_SECURE
+                      );
+                      // 3: Keep screen on
+                      getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-                  WebView webView = this.bridge.getWebView();
-                  WebSettings settings = webView.getSettings();
+                      WebView webView = this.bridge.getWebView();
+                      if (webView != null) {
+                          WebSettings settings = webView.getSettings();
 
-                  // 4-5: Zoom disable
-                  settings.setSupportZoom(false);
-                  settings.setBuiltInZoomControls(false);
-                  settings.setDisplayZoomControls(false);
+                          // 4-5: Zoom disable
+                          settings.setSupportZoom(false);
+                          settings.setBuiltInZoomControls(false);
+                          settings.setDisplayZoomControls(false);
 
-                  // 6-7: Storage + JS
-                  settings.setDomStorageEnabled(true);
-                  settings.setJavaScriptEnabled(true);
+                          // 6-7: Storage + JS
+                          settings.setDomStorageEnabled(true);
+                          settings.setJavaScriptEnabled(true);
 
-                  // 8: Cache
-                  settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+                          // 8: Cache
+                          settings.setCacheMode(WebSettings.LOAD_DEFAULT);
 
-                  // 9: Mixed content block (HTTPS only)
-                  settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+                          // 9: Mixed content block (HTTPS only)
+                          settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
 
-                  // 10: Custom user agent
-                  String ua = settings.getUserAgentString();
-                  settings.setUserAgentString(ua + " RealVisionApp/1.0");
+                          // 10: Custom user agent
+                          String ua = settings.getUserAgentString();
+                          settings.setUserAgentString(ua + " RealVisionApp/1.0");
 
-                  // 11-12: Long-press / text-select disable
-                  webView.setLongClickable(false);
-                  webView.setHapticFeedbackEnabled(false);
-                  webView.setOnLongClickListener(v -> true);
+                          // 11-12: Long-press / text-select disable
+                          webView.setLongClickable(false);
+                          webView.setHapticFeedbackEnabled(false);
+                          webView.setOnLongClickListener(v -> true);
 
-                  // 13: Overscroll/bounce disable
-                  webView.setOverScrollMode(WebView.OVER_SCROLL_NEVER);
+                          // 13: Overscroll/bounce disable
+                          webView.setOverScrollMode(WebView.OVER_SCROLL_NEVER);
 
-                  // 14: Text zoom lock
-                  settings.setTextZoom(100);
+                          // 14: Text zoom lock
+                          settings.setTextZoom(100);
 
-                  // 15: Cookies persist
-                  CookieManager.getInstance().setAcceptCookie(true);
-                  CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
+                          // 15: Cookies persist
+                          CookieManager.getInstance().setAcceptCookie(true);
+                          CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
 
-                  // 16: Disable WebView debugging in production
-                  WebView.setWebContentsDebuggingEnabled(false);
+                          // 16: Disable WebView debugging in production
+                          WebView.setWebContentsDebuggingEnabled(false);
 
-                  // 17: Safe browsing
-                  settings.setSafeBrowsingEnabled(true);
+                          // 17: Safe browsing
+                          settings.setSafeBrowsingEnabled(true);
 
-                  // 18: Render priority
-                  settings.setRenderPriority(WebSettings.RenderPriority.HIGH);
+                          // 18: Render priority
+                          settings.setRenderPriority(WebSettings.RenderPriority.HIGH);
+                      }
 
-                  // 19-20: Root / USB-debug detection warning
-                  if (isRooted()) {
-                      Toast.makeText(this, "ማስጠንቀቂያ፡ ስልኩ root የተደረገ ነው", Toast.LENGTH_LONG).show();
-                  }
-                  if (isUsbDebuggingOn()) {
-                      Toast.makeText(this, "ማስጠንቀቂያ፡ USB Debugging በርቷል", Toast.LENGTH_LONG).show();
-                  }
+                      // 19-20: Root / USB-debug detection warning
+                      if (isRooted()) {
+                          Toast.makeText(this, "ማስጠንቀቂያ፡ ስልኩ root የተደረገ ነው", Toast.LENGTH_LONG).show();
+                      }
+                      if (isUsbDebuggingOn()) {
+                          Toast.makeText(this, "ማስጠንቀቂያ፡ USB Debugging በርቷል", Toast.LENGTH_LONG).show();
+                      }
 
-                  // 21: Network check + bilingual toast
-                  if (!isNetworkAvailable()) {
-                      Toast.makeText(this, "የኢንተርኔት ግንኙነት የለም / No internet connection", Toast.LENGTH_LONG).show();
+                      // 21: Network check + bilingual toast
+                      if (!isNetworkAvailable()) {
+                          Toast.makeText(this, "የኢንተርኔት ግንኙነት የለም / No internet connection", Toast.LENGTH_LONG).show();
+                      }
+                  } catch (Exception e) {
+                      e.printStackTrace();
                   }
               }
 
@@ -132,7 +138,7 @@ jobs:
               @Override
               public void onBackPressed() {
                   WebView webView = this.bridge.getWebView();
-                  if (webView.canGoBack()) {
+                  if (webView != null && webView.canGoBack()) {
                       webView.goBack();
                       return;
                   }
@@ -148,40 +154,56 @@ jobs:
 
               // 24: Vibration feedback
               private void vibrateShort() {
-                  Vibrator v = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
-                  if (v == null) return;
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      v.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE));
-                  } else {
-                      v.vibrate(50);
+                  try {
+                      Vibrator v = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+                      if (v == null) return;
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          v.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE));
+                      } else {
+                          v.vibrate(50);
+                      }
+                  } catch (Exception e) {
+                      e.printStackTrace();
                   }
               }
 
               // 25: Network check helper
               private boolean isNetworkAvailable() {
-                  ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-                  NetworkInfo activeNetwork = cm != null ? cm.getActiveNetworkInfo() : null;
-                  return activeNetwork != null && activeNetwork.isConnectedOrConnecting();
+                  try {
+                      ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                      NetworkInfo activeNetwork = cm != null ? cm.getActiveNetworkInfo() : null;
+                      return activeNetwork != null && activeNetwork.isConnectedOrConnecting();
+                  } catch (Exception e) {
+                      return true;
+                  }
               }
 
               // 26: Root detection helper
               private boolean isRooted() {
-                  String[] paths = {
-                      "/system/app/Superuser.apk", "/sbin/su", "/system/bin/su",
-                      "/system/xbin/su", "/data/local/xbin/su", "/data/local/bin/su",
-                      "/system/sd/xbin/su", "/system/bin/failsafe/su", "/data/local/su"
-                  };
-                  for (String path : paths) {
-                      if (new java.io.File(path).exists()) return true;
+                  try {
+                      String[] paths = {
+                          "/system/app/Superuser.apk", "/sbin/su", "/system/bin/su",
+                          "/system/xbin/su", "/data/local/xbin/su", "/data/local/bin/su",
+                          "/system/sd/xbin/su", "/system/bin/failsafe/su", "/data/local/su"
+                      };
+                      for (String path : paths) {
+                          if (new java.io.File(path).exists()) return true;
+                      }
+                  } catch (Exception e) {
+                      // ignore
                   }
                   return false;
               }
 
               // 27: USB debugging detection helper
               private boolean isUsbDebuggingOn() {
-                  return android.provider.Settings.Secure.getInt(
-                      getContentResolver(),
-                      android.provider.Settings.Global.ADB_ENABLED, 0) == 1;
+                  try {
+                      return android.provider.Settings.Secure.getInt(
+                          getContentResolver(),
+                          android.provider.Settings.Global.ADB_ENABLED, 0) == 1;
+                  } catch (Exception e) {
+                      return false;
+                  }
               }
           }
           JAVAEOF
@@ -195,11 +217,22 @@ jobs:
           with open(path) as f:
               content = f.read()
 
-          # 28-29: Force portrait + keyboard resize on the main activity
-          content = content.replace(
-              '<activity',
-              '<activity\n            android:screenOrientation="portrait"\n            android:windowSoftInputMode="adjustResize"',
-              1
+          # 28-29: Force portrait + keyboard resize, only on MainActivity, only if not already present
+          def add_attrs(match):
+              block = match.group(0)
+              if 'android:screenOrientation' in block:
+                  return block
+              return block.replace(
+                  '<activity',
+                  '<activity\n            android:screenOrientation="portrait"\n            android:windowSoftInputMode="adjustResize"',
+                  1
+              )
+
+          content = re.sub(
+              r'<activity[^>]*android:name="\.MainActivity"[^>]*>',
+              add_attrs,
+              content,
+              count=1
           )
 
           # 30: VIBRATE permission
@@ -210,15 +243,28 @@ jobs:
                   1
               )
 
-          # 31: Deep link intent-filter (web+realvision://) inserted before closing </activity> (first one)
-          deep_link_filter = '''        <intent-filter>
-          <action android:name="android.intent.action.VIEW" />
-          <category android:name="android.intent.category.DEFAULT" />
-          <category android:name="android.intent.category.BROWSABLE" />
-          <data android:scheme="web+realvision" />
-          </intent-filter>
+          # 31: Deep link intent-filter (web+realvision://), inserted only inside MainActivity's block,
+          # right before its closing </activity> tag, and only once.
+          def add_deep_link(match):
+              block = match.group(0)
+              if 'web+realvision' in block:
+                  return block
+              deep_link_filter = '''        <intent-filter>
+              <action android:name="android.intent.action.VIEW" />
+              <category android:name="android.intent.category.DEFAULT" />
+              <category android:name="android.intent.category.BROWSABLE" />
+              <data android:scheme="web+realvision" />
+              </intent-filter>
           </activity>'''
-          content = content.replace('</activity>', deep_link_filter, 1)
+              return re.sub(r'</activity>\s*$', deep_link_filter, block, count=1)
+
+          content = re.sub(
+              r'<activity[^>]*android:name="\.MainActivity".*?</activity>',
+              add_deep_link,
+              content,
+              count=1,
+              flags=re.DOTALL
+          )
 
           with open(path, 'w') as f:
               f.write(content)
@@ -226,8 +272,39 @@ jobs:
 
       - name: Update styles.xml (status/nav bar colors)
         run: |
-          FILE=android/app/src/main/res/values/styles.xml
-          sed -i 's/<\/style>/    <item name="android:statusBarColor">#0b0518<\/item>\n        <item name="android:navigationBarColor">#0b0518<\/item>\n        <item name="android:windowBackground">#0b0518<\/item>\n    <\/style>/' "$FILE"
+          python3 << 'PYEOF'
+          import re
+
+          path = "android/app/src/main/res/values/styles.xml"
+          with open(path) as f:
+              content = f.read()
+
+          # Only inject into the base "AppTheme" style — never into splash-screen
+          # or other derived styles, which is what was crashing the app on launch.
+          def add_items(match):
+              block = match.group(0)
+              if 'android:statusBarColor' in block:
+                  return block
+              return re.sub(
+                  r'</style>\s*$',
+                  '    <item name="android:statusBarColor">#0b0518</item>\n'
+                  '        <item name="android:navigationBarColor">#0b0518</item>\n'
+                  '        <item name="android:windowBackground">#0b0518</item>\n'
+                  '    </style>',
+                  block
+              )
+
+          content = re.sub(
+              r'<style name="AppTheme"[^>]*>.*?</style>',
+              add_items,
+              content,
+              count=1,
+              flags=re.DOTALL
+          )
+
+          with open(path, 'w') as f:
+              f.write(content)
+          PYEOF
 
       - name: Build Debug APK
         run: |
