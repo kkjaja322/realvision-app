@@ -23,6 +23,29 @@ jobs:
           npm install @capacitor/core@^6.0.0 @capacitor/android@^6.0.0 @capacitor/splash-screen@^6.0.0
           npm install -D @capacitor/cli@^6.0.0
 
+      - name: Write capacitor.config.json (points the app at the live site)
+        run: |
+          cat > capacitor.config.json << 'CAPEOF'
+          {
+            "appId": "com.realvisionacademy.app",
+            "appName": "RealVision Academy",
+            "webDir": "www",
+            "server": {
+              "url": "https://realvisionacademy.site.je",
+              "cleartext": false,
+              "androidScheme": "https"
+            },
+            "android": {
+              "allowMixedContent": false
+            }
+          }
+          CAPEOF
+
+      - name: Create placeholder webDir
+        run: |
+          mkdir -p www
+          echo '<!DOCTYPE html><html><body>Loading...</body></html>' > www/index.html
+
       - name: Add Android platform
         run: npx cap add android
 
@@ -191,7 +214,7 @@ jobs:
               }
 
               @Override
-              protected void onResume() {
+              public void onResume() {
                   super.onResume();
                   try {
                       // 34a: Re-check VPN when returning from Settings
@@ -202,7 +225,7 @@ jobs:
               }
 
               @Override
-              protected void onDestroy() {
+              public void onDestroy() {
                   super.onDestroy();
                   try {
                       if (networkCallback != null) {
