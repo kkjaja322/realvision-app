@@ -20,8 +20,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          npm install @capacitor/core @capacitor/android @capacitor/splash-screen
-          npm install -D @capacitor/cli
+          npm install @capacitor/core@^6.0.0 @capacitor/android@^6.0.0 @capacitor/splash-screen@^6.0.0
+          npm install -D @capacitor/cli@^6.0.0
 
       - name: Add Android platform
         run: npx cap add android
