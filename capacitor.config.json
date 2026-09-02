@@ -1,10 +1,19 @@
-{
-  "appId": "je.site.realvisionacademyy.app",
-  "appName": "RealVision Academy",
-  "webDir": "www",
-  "server": {
-    "url": "https://realvisionacademy.site.je",
-    "androidScheme": "https",
-    "cleartext": false
-  }
-}
+- name: Add screenshot-block (FLAG_SECURE)
+        run: |
+          FILE=$(find android -name MainActivity.java)
+          PKG=$(head -n 1 "$FILE")
+          cat > "$FILE" << EOF
+          $PKG
+
+          import android.os.Bundle;
+          import android.view.WindowManager;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
+              }
+          }
+          EOF
