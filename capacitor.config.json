@@ -1,0 +1,10 @@
+{
+  "appId": "je.site.realvisionacademyy.app",
+  "appName": "RealVision Academy",
+  "webDir": "www",
+  "server": {
+    "url": "https://realvisionacademy.site.je",
+    "androidScheme": "https",
+    "cleartext": false
+  }
+}
