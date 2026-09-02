@@ -90,6 +90,7 @@ jobs:
           import android.widget.TextView;
           import android.widget.Toast;
           import com.getcapacitor.BridgeActivity;
+          import com.getcapacitor.BridgeWebViewClient;
           import org.json.JSONObject;
           import java.io.BufferedReader;
           import java.io.InputStreamReader;
@@ -175,6 +176,27 @@ jobs:
 
                           // 35: Native share bridge — call from web page via AndroidShare.shareText("...")
                           webView.addJavascriptInterface(new WebAppInterface(), "AndroidShare");
+
+                          // 39: Retry-once-on-error — cold start (force-close → reopen) races the
+                          // Service Worker registration DB loading from disk against Capacitor's
+                          // first navigation. If SW isn't ready yet and there's no network, the
+                          // request goes straight to DNS and fails (ERR_NAME_NOT_RESOLVED /
+                          // ERR_INTERNET_DISCONNECTED) even though the page IS cached. Reload once,
+                          // 400ms later, so the second attempt hits the now-ready SW cache.
+                          final boolean[] retriedOnce = {false};
+                          webView.setWebViewClient(new BridgeWebViewClient(this.bridge) {
+                              @Override
+                              public void onReceivedError(WebView view, android.webkit.WebResourceRequest request,
+                                                           android.webkit.WebResourceError error) {
+                                  super.onReceivedError(view, request, error);
+                                  if (request.isForMainFrame() && !retriedOnce[0]) {
+                                      retriedOnce[0] = true;
+                                      new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                                          view.loadUrl(request.getUrl().toString());
+                                      }, 400);
+                                  }
+                              }
+                          });
                       }
 
                       // 19-20: Root / USB-debug detection warning
