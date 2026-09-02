@@ -23,7 +23,7 @@ jobs:
           npm install @capacitor/core@^6.0.0 @capacitor/android@^6.0.0 @capacitor/splash-screen@^6.0.0
           npm install -D @capacitor/cli@^6.0.0
 
-      - name: Write capacitor.config.json (points the app at the live site)
+      - name: Write capacitor.config.json (local shell first, no direct server.url)
         run: |
           cat > capacitor.config.json << 'CAPEOF'
           {
@@ -31,9 +31,12 @@ jobs:
             "appName": "RealVision Academy",
             "webDir": "www",
             "server": {
-              "url": "https://realvisionacademy.site.je",
               "cleartext": false,
-              "androidScheme": "https"
+              "androidScheme": "https",
+              "allowNavigation": [
+                "realvisionacademy.site.je",
+                "*.realvisionacademy.site.je"
+              ]
             },
             "android": {
               "allowMixedContent": false
@@ -41,10 +44,122 @@ jobs:
           }
           CAPEOF
 
-      - name: Create placeholder webDir
+      - name: Create local gateway shell (www/index.html)
         run: |
           mkdir -p www
-          echo '<!DOCTYPE html><html><body>Loading...</body></html>' > www/index.html
+          # This is what the WebView loads on EVERY cold start — bundled inside
+          # the APK, so it needs zero network to display. It then runs a real
+          # connectivity probe (not just navigator.onLine, which can be true on
+          # a WiFi network with no actual internet) before navigating to the
+          # live site. If the probe fails, it shows a branded offline card with
+          # a retry button and keeps retrying automatically, instead of ever
+          # letting the WebView attempt a bare navigation to
+          # https://realvisionacademy.site.je while offline (which is what
+          # produced net::ERR_NAME_NOT_RESOLVED before).
+          cat > www/index.html << 'HTMLEOF'
+          <!DOCTYPE html>
+          <html lang="am">
+          <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+          <title>RealVision Academy</title>
+          <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            html, body { height: 100%; background: #0f172a; color: #f1f5f9; font-family: -apple-system, Roboto, "Noto Sans Ethiopic", "Nyala", sans-serif; }
+            #wrap { min-height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 32px 24px; }
+            .logo { width: 84px; height: 84px; border-radius: 20px; background: linear-gradient(135deg, #3b82f6, #1d4ed8); display: flex; align-items: center; justify-content: center; font-size: 38px; margin-bottom: 20px; box-shadow: 0 8px 24px rgba(59,130,246,0.35); }
+            h1 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+            p.sub { color: #94a3b8; font-size: 14px; margin-bottom: 28px; max-width: 320px; line-height: 1.6; }
+            .spinner { width: 34px; height: 34px; border-radius: 50%; border: 3px solid #1e293b; border-top-color: #3b82f6; animation: spin 0.8s linear infinite; margin-bottom: 20px; }
+            @keyframes spin { to { transform: rotate(360deg); } }
+            #offlineCard { display: none; }
+            #offlineCard .icon { font-size: 40px; margin-bottom: 14px; }
+            button#retryBtn { background: #3b82f6; color: #fff; border: none; padding: 12px 28px; border-radius: 10px; font-size: 15px; font-weight: 600; margin-top: 6px; }
+            button#retryBtn:active { background: #1d4ed8; }
+            #status { color: #64748b; font-size: 12px; margin-top: 18px; }
+          </style>
+          </head>
+          <body>
+          <div id="wrap">
+            <div class="logo">🎓</div>
+            <h1>RealVision Academy</h1>
+
+            <div id="loadingCard">
+              <div class="spinner"></div>
+              <p class="sub">በመገናኘት ላይ... / Connecting...</p>
+            </div>
+
+            <div id="offlineCard">
+              <div class="icon">📡</div>
+              <h1>መስመር ላይ አይደሉም</h1>
+              <p class="sub">የኢንተርኔት ግንኙነት አልተገኘም። ኔትወርክዎን ያረጋግጡና እንደገና ይሞክሩ።<br>You're offline. Check your connection and try again.</p>
+              <button id="retryBtn" onclick="manualRetry()">እንደገና ሞክር / Retry</button>
+              <div id="status"></div>
+            </div>
+          </div>
+
+          <script>
+            var LIVE_URL = 'https://realvisionacademy.site.je/';
+            var PROBE_URL = 'https://realvisionacademy.site.je/manifest.json?probe=' + Date.now();
+            var PROBE_TIMEOUT_MS = 4000;
+            var autoRetryTimer = null;
+            var checking = false;
+
+            function showLoading() {
+              document.getElementById('loadingCard').style.display = 'block';
+              document.getElementById('offlineCard').style.display = 'none';
+            }
+            function showOffline(msg) {
+              document.getElementById('loadingCard').style.display = 'none';
+              document.getElementById('offlineCard').style.display = 'block';
+              document.getElementById('status').textContent = msg || '';
+              scheduleAutoRetry();
+            }
+            function scheduleAutoRetry() {
+              if (autoRetryTimer) return;
+              autoRetryTimer = setInterval(function () {
+                if (!checking) probeAndGo();
+              }, 5000);
+            }
+
+            function probeAndGo() {
+              if (checking) return;
+              checking = true;
+              var controller = ('AbortController' in window) ? new AbortController() : null;
+              var timer = setTimeout(function () {
+                if (controller) controller.abort();
+              }, PROBE_TIMEOUT_MS);
+
+              fetch(PROBE_URL, {
+                method: 'GET',
+                cache: 'no-store',
+                mode: 'no-cors',
+                signal: controller ? controller.signal : undefined
+              }).then(function () {
+                clearTimeout(timer);
+                checking = false;
+                if (autoRetryTimer) { clearInterval(autoRetryTimer); autoRetryTimer = null; }
+                window.location.replace(LIVE_URL);
+              }).catch(function () {
+                clearTimeout(timer);
+                checking = false;
+                showOffline('የመጨረሻ ሙከራ: ' + new Date().toLocaleTimeString());
+              });
+            }
+
+            function manualRetry() {
+              showLoading();
+              probeAndGo();
+            }
+
+            window.addEventListener('online', function () { probeAndGo(); });
+
+            showLoading();
+            probeAndGo();
+          </script>
+          </body>
+          </html>
+          HTMLEOF
 
       - name: Add Android platform
         run: npx cap add android
