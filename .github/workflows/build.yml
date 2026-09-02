@@ -57,7 +57,7 @@ jobs:
               private final Handler exitHandler = new Handler();
 
               @Override
-              public void onCreate(Bundle savedInstanceState) {
+              protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
 
                   // 1-2: Screenshot + screen recording block
@@ -216,8 +216,8 @@ jobs:
           <category android:name="android.intent.category.DEFAULT" />
           <category android:name="android.intent.category.BROWSABLE" />
           <data android:scheme="web+realvision" />
-      </intent-filter>
-      </activity>'''
+          </intent-filter>
+          </activity>'''
           content = content.replace('</activity>', deep_link_filter, 1)
 
           with open(path, 'w') as f:
