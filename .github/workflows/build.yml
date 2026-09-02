@@ -212,11 +212,11 @@ jobs:
 
           # 31: Deep link intent-filter (web+realvision://) inserted before closing </activity> (first one)
           deep_link_filter = '''        <intent-filter>
-              <action android:name="android.intent.action.VIEW" />
-              <category android:name="android.intent.category.DEFAULT" />
-              <category android:name="android.intent.category.BROWSABLE" />
-              <data android:scheme="web+realvision" />
-          </intent-filter>
+          <action android:name="android.intent.action.VIEW" />
+          <category android:name="android.intent.category.DEFAULT" />
+          <category android:name="android.intent.category.BROWSABLE" />
+          <data android:scheme="web+realvision" />
+      </intent-filter>
       </activity>'''
           content = content.replace('</activity>', deep_link_filter, 1)
 
