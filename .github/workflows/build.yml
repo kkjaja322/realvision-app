@@ -191,7 +191,7 @@ jobs:
               }
 
               @Override
-              public void onResume() {
+              protected void onResume() {
                   super.onResume();
                   try {
                       // 34a: Re-check VPN when returning from Settings
@@ -202,7 +202,7 @@ jobs:
               }
 
               @Override
-              public void onDestroy() {
+              protected void onDestroy() {
                   super.onDestroy();
                   try {
                       if (networkCallback != null) {
