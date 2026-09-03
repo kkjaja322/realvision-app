@@ -47,6 +47,21 @@ jobs:
       - name: Create local gateway shell (www/index.html)
         run: |
           mkdir -p www
+          # Bug fix: this used to redirect to the bare domain root "/".
+          # index.php is reachable at BOTH "/" and "/index" (see .htaccess),
+          # but they are two different cache keys to the native offline
+          # cache (feature 39 below) and to sw.js. Because normal in-app
+          # navigation (login redirect, "back to home", etc.) always lands
+          # on "/index", that was the URL whose cached copy stayed fresh —
+          # "/" only ever got captured once, at the very first cold start
+          # before the student had logged in. So closing the app and
+          # reopening it offline (or on a slow/flaky connection that made
+          # the live fetch time out) served that old, logged-out "/" copy
+          # instead of the up-to-date logged-in page, which looked like a
+          # random forced logout even though the session/remember-me
+          # cookie was still perfectly valid. Redirecting here to "/index"
+          # instead means the cold-start URL and the everyday in-app URL
+          # are now the same cache key, so it's always kept fresh.
           # This is what the WebView loads on EVERY cold start — bundled inside
           # the APK, so it needs zero network to display. It just hands off
           # immediately to the live URL; MainActivity.java's custom
@@ -60,7 +75,7 @@ jobs:
           <head>
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-          <meta http-equiv="refresh" content="0; url=https://realvisionacademy.site.je/">
+          <meta http-equiv="refresh" content="0; url=https://realvisionacademy.site.je/index">
           <title>RealVision Academy</title>
           <style>
             * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -81,7 +96,7 @@ jobs:
             <p class="sub">በመገናኘት ላይ... / Connecting...</p>
           </div>
           <script>
-            window.location.replace('https://realvisionacademy.site.je/');
+            window.location.replace('https://realvisionacademy.site.je/index');
           </script>
           </body>
           </html>
