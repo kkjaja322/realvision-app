@@ -137,6 +137,8 @@ jobs:
           import android.os.Vibrator;
           import android.os.VibrationEffect;
           import android.view.Gravity;
+          import android.view.GestureDetector;
+          import android.view.MotionEvent;
           import android.view.View;
           import android.view.ViewGroup;
           import android.view.WindowManager;
@@ -147,6 +149,7 @@ jobs:
           import android.webkit.WebSettings;
           import android.webkit.WebView;
           import android.widget.FrameLayout;
+          import android.widget.ProgressBar;
           import android.widget.TextView;
           import android.widget.Toast;
           import com.getcapacitor.BridgeActivity;
@@ -173,6 +176,7 @@ jobs:
               private final Handler exitHandler = new Handler();
               private final Handler bannerHandler = new Handler(Looper.getMainLooper());
               private TextView networkBanner;
+              private ProgressBar topProgressBar;
               private ConnectivityManager.NetworkCallback networkCallback;
               private final Handler connectivityHandler = new Handler(Looper.getMainLooper());
               private boolean vpnDialogShowing = false;
@@ -247,6 +251,57 @@ jobs:
                           // 35: Native share bridge — call from web page via AndroidShare.shareText("...")
                           webView.addJavascriptInterface(new WebAppInterface(), "AndroidShare");
 
+                          // 40: Chrome-style top loading bar — shown on onPageStarted / hidden on
+                          // onPageFinished below (added to the same WebViewClient override, next
+                          // to feature 39, so a single navigation callback drives both).
+                          setupTopProgressBar();
+
+                          // 41: Double-tap anywhere on the page to refresh. Safe to bind directly
+                          // to touch events because zoom is disabled (settings.setSupportZoom
+                          // above), so there's no native double-tap-to-zoom gesture to collide with.
+                          GestureDetector doubleTapDetector = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
+                              @Override
+                              public boolean onDoubleTap(MotionEvent e) {
+                                  webView.reload();
+                                  vibrateShort();
+                                  return true;
+                              }
+
+                              // 42: Edge swipe-back — a left-edge-to-right fling (like iOS/Android
+                              // system back gesture) goes back in WebView history, e.g.
+                              // question_bank -> dashboard. Restricted to swipes that START near
+                              // the left edge, so it never fires from a normal horizontal swipe
+                              // happening elsewhere inside the page content.
+                              @Override
+                              public boolean onFling(MotionEvent e1, MotionEvent e2, float velocityX, float velocityY) {
+                                  if (e1 == null) return false;
+                                  float density = getResources().getDisplayMetrics().density;
+                                  float edgeZone = 40 * density;
+                                  float minDistance = 80 * density;
+                                  float minVelocity = 300 * density;
+
+                                  float diffX = e2.getX() - e1.getX();
+                                  float diffY = e2.getY() - e1.getY();
+                                  boolean startedNearLeftEdge = e1.getX() <= edgeZone;
+                                  boolean isHorizontalSwipe = Math.abs(diffX) > Math.abs(diffY);
+                                  boolean isLeftToRight = diffX > minDistance;
+                                  boolean isFastEnough = Math.abs(velocityX) > minVelocity;
+
+                                  if (startedNearLeftEdge && isHorizontalSwipe && isLeftToRight && isFastEnough) {
+                                      if (webView.canGoBack()) {
+                                          webView.goBack();
+                                          vibrateShort();
+                                      }
+                                      return true;
+                                  }
+                                  return false;
+                              }
+                          });
+                          webView.setOnTouchListener((v, event) -> {
+                              doubleTapDetector.onTouchEvent(event);
+                              return false;
+                          });
+
                           // 39: Native offline cache — Android WebView cannot reliably let a
                           // Service Worker intercept the top-level page (navigation) request,
                           // especially on a cold start; that's what caused
@@ -261,6 +316,54 @@ jobs:
                           // untouched — those still go through the normal WebView/SW pipeline,
                           // which already works fine for them.
                           webView.setWebViewClient(new BridgeWebViewClient(this.bridge) {
+                              @Override
+                              public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                                  super.onPageStarted(view, url, favicon);
+                                  if (topProgressBar != null) topProgressBar.setVisibility(View.VISIBLE);
+                              }
+
+                              @Override
+                              public void onPageFinished(WebView view, String url) {
+                                  super.onPageFinished(view, url);
+                                  if (topProgressBar != null) topProgressBar.setVisibility(View.GONE);
+                              }
+
+                              // 43: Telegram-style offline handling. Previously, tapping a link while
+                              // offline (to a page not yet in the offline cache) fully navigated the
+                              // WebView to OFFLINE_FALLBACK_HTML — replacing whatever the user was
+                              // looking at with a "this page hasn't been saved offline" screen, on
+                              // EVERY tap. This runs earlier, before that navigation even starts: if
+                              // we're offline and the destination isn't cached, it blocks the
+                              // navigation entirely (the current page just stays as-is, untouched)
+                              // and only flashes the top banner — same as Telegram staying on the
+                              // chat list and just showing "Waiting for network..." up top instead of
+                              // replacing the whole screen with an error. The cold-start gateway URL
+                              // (OFFLINE_ENTRY_URL) is deliberately excluded here so it still falls
+                              // through to shouldInterceptRequest below, which knows how to redirect
+                              // it to the last successfully-viewed page.
+                              @Override
+                              public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                                  Uri uri = request.getUrl();
+                                  String host = uri.getHost();
+                                  boolean isLiveDomain = host != null && host.endsWith("realvisionacademy.site.je");
+                                  String urlStr = uri.toString();
+                                  boolean isColdStartEntry = urlStr.equals(OFFLINE_ENTRY_URL);
+                                  if (request.isForMainFrame() && isLiveDomain && !isColdStartEntry
+                                          && "GET".equalsIgnoreCase(request.getMethod())) {
+                                      boolean offline = !isNetworkAvailable();
+                                      if (offline && offlineCacheGetBytes(urlStr) == null) {
+                                          runOnUiThread(() -> {
+                                              setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true);
+                                              Toast.makeText(MainActivity.this,
+                                                  "ይህ ገፅ ገና offline አልተቀመጠም / This page isn't saved offline yet",
+                                                  Toast.LENGTH_SHORT).show();
+                                          });
+                                          return true;
+                                      }
+                                  }
+                                  return super.shouldOverrideUrlLoading(view, request);
+                              }
+
                               @Override
                               public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                                   Uri uri = request.getUrl();
@@ -494,14 +597,36 @@ jobs:
                   }
               }
 
-              // 32a: Sets up a top banner that mimics Telegram's connection status text
+              // 40a: Thin Chrome-style progress bar pinned to the very top of the screen.
+              // Shown by onPageStarted / hidden by onPageFinished (both in the
+              // BridgeWebViewClient override above). Indeterminate rather than
+              // percentage-based, since shouldInterceptRequest already reads the whole
+              // response before handing it to the WebView, so real byte-by-byte progress
+              // isn't available here — a moving bar is enough to signal "loading".
+              private void setupTopProgressBar() {
+                  topProgressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  topProgressBar.setIndeterminate(true);
+                  topProgressBar.setVisibility(View.GONE);
+                  topProgressBar.getProgressDrawable().setColorFilter(Color.parseColor("#3b82f6"), android.graphics.PorterDuff.Mode.SRC_IN);
+
+                  FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT,
+                      6
+                  );
+                  params.gravity = Gravity.TOP;
+                  addContentView(topProgressBar, params);
+              }
+
+              // 32a: Sets up a top banner that mimics Telegram's connection status text —
+              // slim, pinned to the very top, doesn't push or overlay page content below it.
               private void setupNetworkBanner() {
+                  float density = getResources().getDisplayMetrics().density;
                   networkBanner = new TextView(this);
                   networkBanner.setTextColor(Color.WHITE);
-                  networkBanner.setTextSize(13);
+                  networkBanner.setTextSize(12);
                   networkBanner.setGravity(Gravity.CENTER);
                   networkBanner.setBackgroundColor(Color.parseColor("#2b2140"));
-                  networkBanner.setPadding(0, 20, 0, 20);
+                  networkBanner.setPadding(0, (int) (7 * density), 0, (int) (7 * density));
                   networkBanner.setVisibility(View.GONE);
 
                   FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
