@@ -557,19 +557,35 @@ jobs:
                                           String cachedMime = offlineCacheGetMime(urlStr);
                                           return new WebResourceResponse(cachedMime != null ? cachedMime : "text/html", "UTF-8", new ByteArrayInputStream(cached));
                                       }
-                                      // 43-fix: The custom "this page hasn't been saved offline"
-                                      // branded page must NEVER replace the screen — every path that
-                                      // reaches this catch block is guaranteed main-frame + GET (see
-                                      // the early-return filter at the top of this method), and
-                                      // shouldOverrideUrlLoading above already blocks navigation
-                                      // before it starts for the vast majority of offline+uncached
-                                      // taps. For the rare remaining race (request looked reachable
-                                      // at pre-flight time but failed once actually sent), returning
-                                      // null here lets WebView fall through to its own default
-                                      // handling for a failed navigation instead of substituting any
-                                      // custom content — the top banner (already shown) remains the
-                                      // only offline indicator.
-                                      return null;
+                                      // 44: Custom offline fallback page (replaces Chrome's default
+                                      // net::ERR_NAME_NOT_RESOLVED screen). This only fires for the
+                                      // rare race shouldOverrideUrlLoading doesn't catch (request
+                                      // looked reachable at pre-flight but failed once actually sent),
+                                      // or a cold start with zero cache at all — so instead of letting
+                                      // WebView show its raw browser error, we hand back our own
+                                      // branded "not saved offline" page.
+                                      String offlineHtml = "<!DOCTYPE html><html lang=\"am\"><head>"
+                                          + "<meta charset=\"UTF-8\">"
+                                          + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
+                                          + "<style>"
+                                          + "*{box-sizing:border-box;margin:0;padding:0;}"
+                                          + "html,body{height:100%;background:#0f172a;color:#f1f5f9;"
+                                          + "font-family:-apple-system,Roboto,'Noto Sans Ethiopic','Nyala',sans-serif;}"
+                                          + "#wrap{min-height:100%;display:flex;flex-direction:column;"
+                                          + "align-items:center;justify-content:center;text-align:center;padding:32px 24px;}"
+                                          + ".icon{font-size:48px;margin-bottom:18px;}"
+                                          + "h1{font-size:18px;font-weight:700;margin-bottom:10px;}"
+                                          + "p{color:#94a3b8;font-size:14px;max-width:320px;line-height:1.6;margin-bottom:24px;}"
+                                          + "button{background:#3b82f6;color:#fff;border:none;padding:12px 28px;"
+                                          + "border-radius:10px;font-size:15px;font-weight:600;}"
+                                          + "</style></head><body><div id=\"wrap\">"
+                                          + "<div class=\"icon\">📡</div>"
+                                          + "<h1>ገፁ አልተገኘም</h1>"
+                                          + "<p>ይህንን ገፅ online ላይ ሆነው አልተጠቀሙትም ስለዚህ ይመለሱ።</p>"
+                                          + "<button onclick=\"history.back()\">ተመለስ</button>"
+                                          + "</div></body></html>";
+                                      return new WebResourceResponse("text/html", "UTF-8",
+                                          new ByteArrayInputStream(offlineHtml.getBytes(StandardCharsets.UTF_8)));
                                   } finally {
                                       // Bug fix (connection leak): conn was previously never
                                       // disconnected on either the success or the exception path.
