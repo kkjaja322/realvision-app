@@ -118,6 +118,9 @@ jobs:
           $PKG_LINE
 
           import android.app.AlertDialog;
+          import android.animation.Animator;
+          import android.animation.AnimatorListenerAdapter;
+          import android.animation.ValueAnimator;
           import android.content.Context;
           import android.content.Intent;
           import android.content.SharedPreferences;
@@ -142,6 +145,7 @@ jobs:
           import android.view.View;
           import android.view.ViewGroup;
           import android.view.WindowManager;
+          import android.view.animation.DecelerateInterpolator;
           import android.webkit.CookieManager;
           import android.webkit.JavascriptInterface;
           import android.webkit.WebResourceRequest;
@@ -177,9 +181,15 @@ jobs:
               private final Handler bannerHandler = new Handler(Looper.getMainLooper());
               private TextView networkBanner;
               private ProgressBar topProgressBar;
+              private ValueAnimator progressAnimator;
               private ConnectivityManager.NetworkCallback networkCallback;
               private final Handler connectivityHandler = new Handler(Looper.getMainLooper());
               private boolean vpnDialogShowing = false;
+              // Backing signal for feature 43 below — refreshed by checkRealInternet()
+              // (on launch, every 10s, and on every network change), so it's more reliable
+              // than the instantaneous isNetworkAvailable() check alone (that one only knows
+              // "connected to a network", not "that network actually reaches the internet").
+              private volatile boolean hasRealInternetSignal = true;
               private final Runnable periodicConnectivityCheck = new Runnable() {
                   @Override
                   public void run() {
@@ -319,13 +329,13 @@ jobs:
                               @Override
                               public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                                   super.onPageStarted(view, url, favicon);
-                                  if (topProgressBar != null) topProgressBar.setVisibility(View.VISIBLE);
+                                  startLoadingProgress();
                               }
 
                               @Override
                               public void onPageFinished(WebView view, String url) {
                                   super.onPageFinished(view, url);
-                                  if (topProgressBar != null) topProgressBar.setVisibility(View.GONE);
+                                  finishLoadingProgress();
                               }
 
                               // 43: Telegram-style offline handling. Previously, tapping a link while
@@ -350,14 +360,16 @@ jobs:
                                   boolean isColdStartEntry = urlStr.equals(OFFLINE_ENTRY_URL);
                                   if (request.isForMainFrame() && isLiveDomain && !isColdStartEntry
                                           && "GET".equalsIgnoreCase(request.getMethod())) {
-                                      boolean offline = !isNetworkAvailable();
+                                      // Uses the periodically-refreshed real-internet probe, not just
+                                      // isNetworkAvailable() — that flag can say "connected" even when
+                                      // the network can't actually reach the server, which used to let
+                                      // doomed navigations through to shouldInterceptRequest below and
+                                      // land on the "not saved offline" fallback page. No toast/popup
+                                      // here — the top banner alone is the only offline indicator, as
+                                      // requested (Telegram-style: quiet, top-only, never interrupts).
+                                      boolean offline = !isNetworkAvailable() || !hasRealInternetSignal;
                                       if (offline && offlineCacheGetBytes(urlStr) == null) {
-                                          runOnUiThread(() -> {
-                                              setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true);
-                                              Toast.makeText(MainActivity.this,
-                                                  "ይህ ገፅ ገና offline አልተቀመጠም / This page isn't saved offline yet",
-                                                  Toast.LENGTH_SHORT).show();
-                                          });
+                                          runOnUiThread(() -> setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true));
                                           return true;
                                       }
                                   }
@@ -375,8 +387,8 @@ jobs:
                                   String urlStr = uri.toString();
                                   try {
                                       HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
-                                      conn.setConnectTimeout(5000);
-                                      conn.setReadTimeout(8000);
+                                      conn.setConnectTimeout(8000);
+                                      conn.setReadTimeout(12000);
                                       conn.setInstanceFollowRedirects(true);
                                       for (Map.Entry<String, String> h : request.getRequestHeaders().entrySet()) {
                                           conn.setRequestProperty(h.getKey(), h.getValue());
@@ -597,15 +609,18 @@ jobs:
                   }
               }
 
-              // 40a: Thin Chrome-style progress bar pinned to the very top of the screen.
-              // Shown by onPageStarted / hidden by onPageFinished (both in the
-              // BridgeWebViewClient override above). Indeterminate rather than
-              // percentage-based, since shouldInterceptRequest already reads the whole
-              // response before handing it to the WebView, so real byte-by-byte progress
-              // isn't available here — a moving bar is enough to signal "loading".
+              // 40a: Chrome/YouTube-style animated top progress bar, pinned to the very
+              // top. We don't have real byte-level progress (shouldInterceptRequest reads
+              // the whole main-document response before handing it to the WebView, and
+              // sub-resources load through the normal pipeline), so this fakes it the same
+              // way most professional apps do: ease quickly up to ~90% while the page is
+              // loading, then snap to 100% and fade out the instant it's done. See
+              // startLoadingProgress()/finishLoadingProgress() below.
               private void setupTopProgressBar() {
                   topProgressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-                  topProgressBar.setIndeterminate(true);
+                  topProgressBar.setIndeterminate(false);
+                  topProgressBar.setMax(100);
+                  topProgressBar.setProgress(0);
                   topProgressBar.setVisibility(View.GONE);
                   topProgressBar.getProgressDrawable().setColorFilter(Color.parseColor("#3b82f6"), android.graphics.PorterDuff.Mode.SRC_IN);
 
@@ -615,6 +630,53 @@ jobs:
                   );
                   params.gravity = Gravity.TOP;
                   addContentView(topProgressBar, params);
+              }
+
+              // Called from onPageStarted: reset to 0%, fade fully in, then glide up to 90%
+              // over 4s with a decelerating curve (fast start, slow crawl) — never reaching
+              // 100% on its own, so it always looks "alive" for however long the real load
+              // actually takes, instead of stalling flat like a plain indeterminate spinner.
+              private void startLoadingProgress() {
+                  if (topProgressBar == null) return;
+                  if (progressAnimator != null) progressAnimator.cancel();
+                  topProgressBar.animate().cancel();
+                  topProgressBar.setAlpha(1f);
+                  topProgressBar.setProgress(0);
+                  topProgressBar.setVisibility(View.VISIBLE);
+
+                  progressAnimator = ValueAnimator.ofInt(0, 90);
+                  progressAnimator.setDuration(4000);
+                  progressAnimator.setInterpolator(new DecelerateInterpolator(1.5f));
+                  progressAnimator.addUpdateListener(a -> topProgressBar.setProgress((int) a.getAnimatedValue()));
+                  progressAnimator.start();
+              }
+
+              // Called from onPageFinished: snap the remaining distance to 100% quickly
+              // (200ms), hold briefly so the completed bar is visible, then fade out and
+              // reset — ready for the next navigation.
+              private void finishLoadingProgress() {
+                  if (topProgressBar == null) return;
+                  if (progressAnimator != null) progressAnimator.cancel();
+
+                  ValueAnimator finishAnim = ValueAnimator.ofInt(topProgressBar.getProgress(), 100);
+                  finishAnim.setDuration(200);
+                  finishAnim.addUpdateListener(a -> topProgressBar.setProgress((int) a.getAnimatedValue()));
+                  finishAnim.addListener(new AnimatorListenerAdapter() {
+                      @Override
+                      public void onAnimationEnd(Animator animation) {
+                          topProgressBar.animate()
+                              .alpha(0f)
+                              .setStartDelay(150)
+                              .setDuration(250)
+                              .withEndAction(() -> {
+                                  topProgressBar.setVisibility(View.GONE);
+                                  topProgressBar.setProgress(0);
+                                  topProgressBar.setAlpha(1f);
+                              })
+                              .start();
+                      }
+                  });
+                  finishAnim.start();
               }
 
               // 32a: Sets up a top banner that mimics Telegram's connection status text —
@@ -682,6 +744,7 @@ jobs:
               // most common cause of that condition.
               private void checkRealInternet() {
                   if (!isNetworkAvailable()) {
+                      hasRealInternetSignal = false;
                       runOnUiThread(() -> setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true));
                       return;
                   }
@@ -696,6 +759,7 @@ jobs:
                           hasRealInternet = false;
                       }
                       final boolean result = hasRealInternet;
+                      hasRealInternetSignal = result;
                       runOnUiThread(() -> {
                           if (!isNetworkAvailable()) {
                               setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true);
