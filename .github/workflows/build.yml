@@ -416,22 +416,21 @@ jobs:
                                       // land on the "not saved offline" fallback page. No toast/popup
                                       // here — the top banner alone is the only offline indicator, as
                                       // requested (Telegram-style: quiet, top-only, never interrupts).
+                                      //
+                                      // Bug fix (CRASH — NetworkOnMainThreadException): a previous
+                                      // revision called quickRealConnectivityProbe() (a blocking
+                                      // socket connect) directly here. shouldOverrideUrlLoading is
+                                      // documented by Android to run on the UI thread, so that call
+                                      // crashed the app on almost every tap to a not-yet-cached page.
+                                      // Removed — hasRealInternetSignal (refreshed every ~10s by
+                                      // checkRealInternet(), safely on a background thread) plus the
+                                      // shouldInterceptRequest catch-block below (which never shows
+                                      // the branded fallback either way) together already guarantee
+                                      // the one hard requirement: the "not saved offline" page can
+                                      // never appear, without ever blocking the UI thread on network.
                                       boolean offline = !isNetworkAvailable() || !hasRealInternetSignal;
                                       boolean hasCache = offlineCacheGetBytes(urlStr) != null;
                                       if (offline && !hasCache) {
-                                          runOnUiThread(() -> setBanner(offlineBannerText(), true));
-                                          return true;
-                                      }
-                                      // 43b: hasRealInternetSignal only refreshes every ~10s (see
-                                      // checkRealInternet below), so it can still read "online" for
-                                      // a few seconds right after the connection actually drops.
-                                      // Re-confirm with one quick synchronous probe before letting
-                                      // navigation start — only when there's no cached copy to fall
-                                      // back on, since a cache hit makes the live fetch's outcome
-                                      // irrelevant either way. Kept well under ~1s so it never makes
-                                      // a normal (online) tap feel delayed.
-                                      if (!hasCache && !quickRealConnectivityProbe()) {
-                                          hasRealInternetSignal = false;
                                           runOnUiThread(() -> setBanner(offlineBannerText(), true));
                                           return true;
                                       }
@@ -855,25 +854,6 @@ jobs:
                           }
                       });
                   }).start();
-              }
-
-              // 43c: Fast, synchronous, best-effort connectivity probe — used ONLY inside
-              // shouldOverrideUrlLoading, right before a main-frame navigation would be
-              // allowed to start. Deliberately separate from checkRealInternet() above:
-              // that one runs on a background thread and only refreshes
-              // hasRealInternetSignal every ~10s, which is too stale to trust for a
-              // single tap. This blocks the calling thread briefly (bounded by the
-              // timeout below), so it must stay short enough to never make a normal tap
-              // feel stuck.
-              private boolean quickRealConnectivityProbe() {
-                  try {
-                      java.net.Socket socket = new java.net.Socket();
-                      socket.connect(new java.net.InetSocketAddress("realvisionacademy.site.je", 443), 900);
-                      socket.close();
-                      return true;
-                  } catch (Exception e) {
-                      return false;
-                  }
               }
 
               // 34a: Detects an active VPN connection and, if found, shows a blocking dialog.
