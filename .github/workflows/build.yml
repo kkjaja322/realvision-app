@@ -47,21 +47,23 @@ jobs:
       - name: Create local gateway shell (www/index.html)
         run: |
           mkdir -p www
-          # Bug fix: this used to redirect to the bare domain root "/".
-          # index.php is reachable at BOTH "/" and "/index" (see .htaccess),
-          # but they are two different cache keys to the native offline
-          # cache (feature 39 below) and to sw.js. Because normal in-app
-          # navigation (login redirect, "back to home", etc.) always lands
-          # on "/index", that was the URL whose cached copy stayed fresh —
-          # "/" only ever got captured once, at the very first cold start
-          # before the student had logged in. So closing the app and
-          # reopening it offline (or on a slow/flaky connection that made
-          # the live fetch time out) served that old, logged-out "/" copy
-          # instead of the up-to-date logged-in page, which looked like a
-          # random forced logout even though the session/remember-me
-          # cookie was still perfectly valid. Redirecting here to "/index"
-          # instead means the cold-start URL and the everyday in-app URL
-          # are now the same cache key, so it's always kept fresh.
+          # Bug fix (round 2): this used to redirect to "/" (and, in an
+          # earlier attempt, to "/index"). Both are wrong for the same
+          # underlying reason: index.php is the PUBLIC guest landing page —
+          # it always shows the "Login" button/marketing home, even for an
+          # already-logged-in student, because it's not the app's real
+          # per-student home. The actual home lives at one of 4 dept-scoped
+          # entry files (natural_dashboard.php / social_dashboard.php /
+          # freshman_dashboard.php / other_dashboard.php), each of which
+          # starts with: if (!isLoggedIn()) redirect to /index; else if
+          # wrong department, redirect to the correct dept dashboard. That
+          # makes any one of them a self-correcting router. We use
+          # "/other_dashboard" here for exactly that: a guest lands on
+          # /index as normal, but an already-logged-in student (any
+          # department) is auto-redirected server-side straight to their
+          # real dashboard — so the offline cache captured under this URL
+          # always reflects "am I logged in, and as whom" correctly,
+          # instead of permanently showing the guest/login screen.
           # This is what the WebView loads on EVERY cold start — bundled inside
           # the APK, so it needs zero network to display. It just hands off
           # immediately to the live URL; MainActivity.java's custom
@@ -75,7 +77,7 @@ jobs:
           <head>
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-          <meta http-equiv="refresh" content="0; url=https://realvisionacademy.site.je/index">
+          <meta http-equiv="refresh" content="0; url=https://realvisionacademy.site.je/other_dashboard">
           <title>RealVision Academy</title>
           <style>
             * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -96,7 +98,7 @@ jobs:
             <p class="sub">በመገናኘት ላይ... / Connecting...</p>
           </div>
           <script>
-            window.location.replace('https://realvisionacademy.site.je/index');
+            window.location.replace('https://realvisionacademy.site.je/other_dashboard');
           </script>
           </body>
           </html>
