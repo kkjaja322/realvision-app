@@ -293,9 +293,35 @@ jobs:
                                       String mime = (contentType != null && contentType.contains("/")) ? contentType.split(";")[0].trim() : "text/html";
                                       if (code >= 200 && code < 300) {
                                           offlineCachePut(urlStr, mime, data);
+                                          // Bug fix ("close app, reopen offline -> lands on login"):
+                                          // urlStr is the ORIGINALLY requested URL (always the fixed
+                                          // gateway entry, e.g. /other_dashboard), but conn followed
+                                          // server-side redirects, so conn.getURL() is the REAL page
+                                          // that ended up rendering (e.g. /natural_dashboard, or /index
+                                          // for a guest). Cache under that real URL too, and remember
+                                          // it as "last successful page" — that pointer is what the
+                                          // offline path below trusts for the gateway URL, instead of
+                                          // only the gateway URL's own cache entry.
+                                          String finalUrl = (conn.getURL() != null) ? conn.getURL().toString() : urlStr;
+                                          if (!finalUrl.equals(urlStr)) {
+                                              offlineCachePut(finalUrl, mime, data);
+                                          }
+                                          getSharedPreferences("realvision_prefs", MODE_PRIVATE)
+                                              .edit().putString("last_page_url", finalUrl).apply();
                                       }
                                       return new WebResourceResponse(mime, "UTF-8", new ByteArrayInputStream(data));
                                   } catch (Exception e) {
+                                      if (urlStr.equals(OFFLINE_ENTRY_URL)) {
+                                          String lastUrl = getSharedPreferences("realvision_prefs", MODE_PRIVATE)
+                                              .getString("last_page_url", null);
+                                          if (lastUrl != null) {
+                                              byte[] lastCached = offlineCacheGetBytes(lastUrl);
+                                              if (lastCached != null) {
+                                                  String lastMime = offlineCacheGetMime(lastUrl);
+                                                  return new WebResourceResponse(lastMime != null ? lastMime : "text/html", "UTF-8", new ByteArrayInputStream(lastCached));
+                                              }
+                                          }
+                                      }
                                       byte[] cached = offlineCacheGetBytes(urlStr);
                                       if (cached != null) {
                                           String cachedMime = offlineCacheGetMime(urlStr);
@@ -356,6 +382,11 @@ jobs:
               }
 
               // --- Native offline cache helpers (feature 39) -----------------------
+
+              // Must match the URL the bundled www/index.html gateway shell
+              // redirects to on every cold start (see "Create local gateway
+              // shell" step above).
+              private static final String OFFLINE_ENTRY_URL = "https://realvisionacademy.site.je/other_dashboard";
 
               private static final String OFFLINE_FALLBACK_HTML =
                   "<!DOCTYPE html><html lang=\"am\"><head><meta charset=\"UTF-8\">" +
