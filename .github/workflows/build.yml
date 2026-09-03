@@ -271,6 +271,18 @@ jobs:
                           // to touch events because zoom is disabled (settings.setSupportZoom
                           // above), so there's no native double-tap-to-zoom gesture to collide with.
                           GestureDetector doubleTapDetector = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
+                              // Bug fix (double-tap needed 4 taps / 2 double-taps): GestureDetector
+                              // must have onDown() return true for its internal tap sequence to be
+                              // tracked correctly from the very first touch. SimpleOnGestureListener's
+                              // default onDown() returns false, which can leave the detector's
+                              // internal "waiting for the matching second tap" state one step behind
+                              // — the first double-tap attempt gets silently absorbed re-arming the
+                              // detector, and only the NEXT double-tap actually fires onDoubleTap.
+                              @Override
+                              public boolean onDown(MotionEvent e) {
+                                  return true;
+                              }
+
                               @Override
                               public boolean onDoubleTap(MotionEvent e) {
                                   webView.reload();
@@ -407,7 +419,7 @@ jobs:
                                       boolean offline = !isNetworkAvailable() || !hasRealInternetSignal;
                                       boolean hasCache = offlineCacheGetBytes(urlStr) != null;
                                       if (offline && !hasCache) {
-                                          runOnUiThread(() -> setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true));
+                                          runOnUiThread(() -> setBanner(offlineBannerText(), true));
                                           return true;
                                       }
                                       // 43b: hasRealInternetSignal only refreshes every ~10s (see
@@ -420,7 +432,7 @@ jobs:
                                       // a normal (online) tap feel delayed.
                                       if (!hasCache && !quickRealConnectivityProbe()) {
                                           hasRealInternetSignal = false;
-                                          runOnUiThread(() -> setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true));
+                                          runOnUiThread(() -> setBanner(offlineBannerText(), true));
                                           return true;
                                       }
                                   }
@@ -753,18 +765,20 @@ jobs:
                   networkCallback = new ConnectivityManager.NetworkCallback() {
                       @Override
                       public void onLost(Network network) {
-                          runOnUiThread(() -> setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true));
+                          hasRealInternetSignal = false;
+                          runOnUiThread(() -> setBanner(offlineBannerText(), true));
                       }
 
                       @Override
                       public void onUnavailable() {
-                          runOnUiThread(() -> setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true));
+                          hasRealInternetSignal = false;
+                          runOnUiThread(() -> setBanner(offlineBannerText(), true));
                       }
 
                       @Override
                       public void onAvailable(Network network) {
                           runOnUiThread(() -> {
-                              setBanner("Connecting...", true);
+                              setBanner(BANNER_CONNECTING, true);
                               bannerHandler.postDelayed(() -> {
                                   setBanner("Updating...", true);
                                   WebView webView = bridge != null ? bridge.getWebView() : null;
@@ -791,11 +805,20 @@ jobs:
               // directly, so this is only a proxy signal for "no real internet", which is the
               // most common cause of that condition.
               private void checkRealInternet() {
-                  if (!isNetworkAvailable()) {
+                  if (isAirplaneModeOn()) {
                       hasRealInternetSignal = false;
-                      runOnUiThread(() -> setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true));
+                      runOnUiThread(() -> setBanner(BANNER_FLIGHT_MODE, true));
                       return;
                   }
+                  if (!isNetworkAvailable()) {
+                      hasRealInternetSignal = false;
+                      runOnUiThread(() -> setBanner(BANNER_OFFLINE, true));
+                      return;
+                  }
+                  // Network reports "connected" but that alone doesn't mean it reaches the
+                  // internet (weak signal, or the SIM's data package/balance ran out) — show
+                  // "Connecting..." immediately while the real probe below confirms either way.
+                  runOnUiThread(() -> setBanner(BANNER_CONNECTING, true));
                   new Thread(() -> {
                       boolean hasRealInternet;
                       try {
@@ -807,12 +830,26 @@ jobs:
                           hasRealInternet = false;
                       }
                       final boolean result = hasRealInternet;
+                      // Captured BEFORE we overwrite hasRealInternetSignal below, so this is
+                      // the state as of the previous check — used only to detect the
+                      // offline -> online transition (see the new branch below).
+                      final boolean wasOffline = !hasRealInternetSignal;
                       hasRealInternetSignal = result;
                       runOnUiThread(() -> {
-                          if (!isNetworkAvailable()) {
-                              setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true);
+                          if (isAirplaneModeOn()) {
+                              setBanner(BANNER_FLIGHT_MODE, true);
+                          } else if (!isNetworkAvailable()) {
+                              setBanner(BANNER_OFFLINE, true);
                           } else if (!result) {
-                              setBanner("YOU ARE ONLINE BUT CHECK YOUR PACKAGE!", true);
+                              // Weak signal / exhausted data package — stay on "Connecting..."
+                              // rather than a technical "check your package" message.
+                              setBanner(BANNER_CONNECTING, true);
+                          } else if (wasOffline) {
+                              // Internet just came back — show a brief confirmation instead of
+                              // silently hiding the banner, then fade it out on its own after a
+                              // couple of seconds (Telegram/WhatsApp-style).
+                              setBanner(BANNER_ONLINE, true);
+                              bannerHandler.postDelayed(() -> setBanner(null, false), 1800);
                           } else {
                               setBanner(null, false);
                           }
@@ -923,6 +960,38 @@ jobs:
                   } catch (Exception e) {
                       return true;
                   }
+              }
+
+              // 32a: Top banner text — one source of truth for all four states, used
+              // by checkRealInternet(), shouldOverrideUrlLoading, and the
+              // ConnectivityManager.NetworkCallback below, so the wording never drifts
+              // out of sync between call sites.
+              //   1. Flight mode ON                              -> BANNER_FLIGHT_MODE
+              //   2. Flight mode OFF, no active network (data/WiFi both off) -> BANNER_OFFLINE
+              //   3. Network active but no real internet (weak signal / 0 data package) -> BANNER_CONNECTING
+              //   4. Everything working (real internet confirmed)  -> BANNER_ONLINE (flashed briefly, then hidden)
+              private static final String BANNER_FLIGHT_MODE = "FLIGHT MODE IS ON, TURN IT OFF TO CONTINUE";
+              private static final String BANNER_OFFLINE = "YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK";
+              private static final String BANNER_CONNECTING = "Connecting...";
+              private static final String BANNER_ONLINE = "YOU ARE ONLINE";
+
+              // 32b: True only when the device's Airplane/Flight mode toggle itself is on
+              // — distinct from "just no active network", so the banner can tell the
+              // student exactly what to turn off instead of a generic offline message.
+              private boolean isAirplaneModeOn() {
+                  try {
+                      return Settings.Global.getInt(getContentResolver(), Settings.Global.AIRPLANE_MODE_ON, 0) != 0;
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+
+              // 32c: Resolves the correct "not connected" banner text for the current
+              // instant. Only meaningful when NOT truly online — callers already know
+              // that from context (isNetworkAvailable()/hasRealInternetSignal), this
+              // just picks between the flight-mode-specific and generic offline wording.
+              private String offlineBannerText() {
+                  return isAirplaneModeOn() ? BANNER_FLIGHT_MODE : BANNER_OFFLINE;
               }
 
               // 26: Root detection helper
