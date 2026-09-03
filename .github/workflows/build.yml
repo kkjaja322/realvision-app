@@ -148,6 +148,7 @@ jobs:
           import android.view.animation.DecelerateInterpolator;
           import android.webkit.CookieManager;
           import android.webkit.JavascriptInterface;
+          import android.webkit.WebResourceError;
           import android.webkit.WebResourceRequest;
           import android.webkit.WebResourceResponse;
           import android.webkit.WebSettings;
@@ -312,6 +313,29 @@ jobs:
                               return false;
                           });
 
+                          // 42a: Without this, a left-edge swipe is captured by Android's own
+                          // gesture navigation (API 29+ default: edge swipe = system Back, or
+                          // the Recents/app-switcher preview if dragged/held) BEFORE it ever
+                          // reaches the OnTouchListener above — this is exactly the "swipe
+                          // left-to-right opens Recents instead of going back in the page"
+                          // symptom. Declaring this strip as a system-gesture exclusion zone
+                          // asks the OS to hand touches starting there to the app instead.
+                          // Must be re-posted on every layout pass since it needs real pixel
+                          // dimensions (0x0 on the very first call, before layout completes).
+                          // Best-effort only: the OS can still cap how much edge an app is
+                          // allowed to claim, and a user can always force the system gesture
+                          // by repeating the same swipe a second time.
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                              webView.addOnLayoutChangeListener((v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
+                                  if (v.getWidth() <= 0 || v.getHeight() <= 0) return;
+                                  float density = getResources().getDisplayMetrics().density;
+                                  int exclusionWidth = (int) (40 * density);
+                                  java.util.List<android.graphics.Rect> rects = new java.util.ArrayList<>();
+                                  rects.add(new android.graphics.Rect(0, 0, exclusionWidth, v.getHeight()));
+                                  v.setSystemGestureExclusionRects(rects);
+                              });
+                          }
+
                           // 39: Native offline cache — Android WebView cannot reliably let a
                           // Service Worker intercept the top-level page (navigation) request,
                           // especially on a cold start; that's what caused
@@ -338,10 +362,23 @@ jobs:
                                   finishLoadingProgress();
                               }
 
+                              // 40a: Safety net for the top progress bar. onPageFinished is not
+                              // guaranteed to fire on every device/OS version after a main-frame
+                              // load fails (e.g. shouldInterceptRequest's catch-block below now
+                              // returns null instead of a substitute page — see 43 fix). Without
+                              // this, that scenario could leave the bar frozen at ~90% forever.
+                              @Override
+                              public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                                  super.onReceivedError(view, request, error);
+                                  if (request != null && request.isForMainFrame()) {
+                                      finishLoadingProgress();
+                                  }
+                              }
+
                               // 43: Telegram-style offline handling. Previously, tapping a link while
                               // offline (to a page not yet in the offline cache) fully navigated the
-                              // WebView to OFFLINE_FALLBACK_HTML — replacing whatever the user was
-                              // looking at with a "this page hasn't been saved offline" screen, on
+                              // WebView to a branded "this page hasn't been saved offline" page —
+                              // replacing whatever the user was looking at with that screen, on
                               // EVERY tap. This runs earlier, before that navigation even starts: if
                               // we're offline and the destination isn't cached, it blocks the
                               // navigation entirely (the current page just stays as-is, untouched)
@@ -368,7 +405,21 @@ jobs:
                                       // here — the top banner alone is the only offline indicator, as
                                       // requested (Telegram-style: quiet, top-only, never interrupts).
                                       boolean offline = !isNetworkAvailable() || !hasRealInternetSignal;
-                                      if (offline && offlineCacheGetBytes(urlStr) == null) {
+                                      boolean hasCache = offlineCacheGetBytes(urlStr) != null;
+                                      if (offline && !hasCache) {
+                                          runOnUiThread(() -> setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true));
+                                          return true;
+                                      }
+                                      // 43b: hasRealInternetSignal only refreshes every ~10s (see
+                                      // checkRealInternet below), so it can still read "online" for
+                                      // a few seconds right after the connection actually drops.
+                                      // Re-confirm with one quick synchronous probe before letting
+                                      // navigation start — only when there's no cached copy to fall
+                                      // back on, since a cache hit makes the live fetch's outcome
+                                      // irrelevant either way. Kept well under ~1s so it never makes
+                                      // a normal (online) tap feel delayed.
+                                      if (!hasCache && !quickRealConnectivityProbe()) {
+                                          hasRealInternetSignal = false;
                                           runOnUiThread(() -> setBanner("YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK", true));
                                           return true;
                                       }
@@ -442,8 +493,19 @@ jobs:
                                           String cachedMime = offlineCacheGetMime(urlStr);
                                           return new WebResourceResponse(cachedMime != null ? cachedMime : "text/html", "UTF-8", new ByteArrayInputStream(cached));
                                       }
-                                      byte[] fallback = OFFLINE_FALLBACK_HTML.getBytes(StandardCharsets.UTF_8);
-                                      return new WebResourceResponse("text/html", "UTF-8", new ByteArrayInputStream(fallback));
+                                      // 43-fix: The custom "this page hasn't been saved offline"
+                                      // branded page must NEVER replace the screen — every path that
+                                      // reaches this catch block is guaranteed main-frame + GET (see
+                                      // the early-return filter at the top of this method), and
+                                      // shouldOverrideUrlLoading above already blocks navigation
+                                      // before it starts for the vast majority of offline+uncached
+                                      // taps. For the rare remaining race (request looked reachable
+                                      // at pre-flight time but failed once actually sent), returning
+                                      // null here lets WebView fall through to its own default
+                                      // handling for a failed navigation instead of substituting any
+                                      // custom content — the top banner (already shown) remains the
+                                      // only offline indicator.
+                                      return null;
                                   }
                               }
                           });
@@ -503,20 +565,6 @@ jobs:
               // shell" step above).
               private static final String OFFLINE_ENTRY_URL = "https://realvisionacademy.site.je/other_dashboard";
 
-              private static final String OFFLINE_FALLBACK_HTML =
-                  "<!DOCTYPE html><html lang=\"am\"><head><meta charset=\"UTF-8\">" +
-                  "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">" +
-                  "<title>RealVision Academy</title><style>" +
-                  "*{box-sizing:border-box;margin:0;padding:0}" +
-                  "html,body{height:100%;background:#0f172a;color:#f1f5f9;font-family:sans-serif}" +
-                  "#w{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:32px 24px}" +
-                  ".logo{width:84px;height:84px;border-radius:20px;background:linear-gradient(135deg,#3b82f6,#1d4ed8);display:flex;align-items:center;justify-content:center;font-size:38px;margin-bottom:20px}" +
-                  "h1{font-size:20px;font-weight:700;margin-bottom:6px}" +
-                  "p{color:#94a3b8;font-size:14px;max-width:320px;line-height:1.6;margin-top:6px}" +
-                  "</style></head><body><div id=\"w\"><div class=\"logo\">&#127891;</div>" +
-                  "<h1>&#4218;&#4661;&#121;&#4635;&#4763; &#4622;&#4837; &#4771;&#4813;&#4291;&#4291;&#4275;</h1>" +
-                  "<p>&#4864;&#4655; &#4308;&#4295;&#4271;&#4231;&#4265;&#4275; &#4632;&#4231;&#4275;&#4275;. &#4635;&#4761;&#4231;&#4275;&#4275; &#4632;&#4661;&#4295;&#4231; &#4635;&#4771;&#4275;&#4271; &#4661;&#4231;&#4231; &#4691;&#4661;&#4231;&#4771;&#4275;&#4291; &#4635;&#4265;&#4266;&#4275;&#4291; &#4295;&#4271;&#4291;&#4635;.<br>This page hasn't been saved for offline use yet. Please open it once while online.</p>" +
-                  "</div></body></html>";
 
               private File offlineCacheDir() {
                   File dir = new File(getFilesDir(), "offline_cache");
@@ -770,6 +818,25 @@ jobs:
                           }
                       });
                   }).start();
+              }
+
+              // 43c: Fast, synchronous, best-effort connectivity probe — used ONLY inside
+              // shouldOverrideUrlLoading, right before a main-frame navigation would be
+              // allowed to start. Deliberately separate from checkRealInternet() above:
+              // that one runs on a background thread and only refreshes
+              // hasRealInternetSignal every ~10s, which is too stale to trust for a
+              // single tap. This blocks the calling thread briefly (bounded by the
+              // timeout below), so it must stay short enough to never make a normal tap
+              // feel stuck.
+              private boolean quickRealConnectivityProbe() {
+                  try {
+                      java.net.Socket socket = new java.net.Socket();
+                      socket.connect(new java.net.InetSocketAddress("realvisionacademy.site.je", 443), 900);
+                      socket.close();
+                      return true;
+                  } catch (Exception e) {
+                      return false;
+                  }
               }
 
               // 34a: Detects an active VPN connection and, if found, shows a blocking dialog.
