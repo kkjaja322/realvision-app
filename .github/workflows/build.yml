@@ -438,6 +438,17 @@ jobs:
                                   return super.shouldOverrideUrlLoading(view, request);
                               }
 
+                              // Followed a maximum chain length to avoid ever looping forever on a
+                              // misconfigured server that redirects to itself. Cleared whenever a
+                              // request resolves without a redirect (see the 2xx/attempt-reset
+                              // branch below), so normal browsing never accumulates stale counts.
+                              private static final int MAX_REDIRECTS = 5;
+                              private final Map<String, Integer> redirectHops = new java.util.concurrent.ConcurrentHashMap<>();
+
+                              private int redirectHopCount(String targetUrl) {
+                                  return redirectHops.merge(targetUrl, 1, Integer::sum);
+                              }
+
                               @Override
                               public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                                   Uri uri = request.getUrl();
@@ -447,11 +458,28 @@ jobs:
                                       return super.shouldInterceptRequest(view, request);
                                   }
                                   String urlStr = uri.toString();
+                                  HttpURLConnection conn = null;
                                   try {
-                                      HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
+                                      conn = (HttpURLConnection) new URL(urlStr).openConnection();
                                       conn.setConnectTimeout(8000);
                                       conn.setReadTimeout(12000);
-                                      conn.setInstanceFollowRedirects(true);
+                                      // Bug fix (URL/WebView mismatch): this used to be
+                                      // setInstanceFollowRedirects(true). That made HttpURLConnection
+                                      // silently chase a server-side redirect (e.g.
+                                      // /other_dashboard -> /natural_dashboard.php) itself, entirely
+                                      // outside the WebView. The response body that came back was the
+                                      // REAL page's HTML, but the WebView had only ever been told
+                                      // about the ORIGINAL request — so window.location.href,
+                                      // pathname, any "copy link"/share feature, and relative
+                                      // asset/AJAX paths on the page all kept pointing at
+                                      // /other_dashboard forever, never the page that was actually
+                                      // showing. Redirects are now followed manually below, one hop
+                                      // at a time, by handing each hop to WebView as its own real
+                                      // navigation (view.loadUrl) instead of hiding it inside a
+                                      // background HTTP client — so the WebView's address always
+                                      // matches what's on screen, and relative paths on a future
+                                      // sub-folder page would resolve correctly too.
+                                      conn.setInstanceFollowRedirects(false);
                                       for (Map.Entry<String, String> h : request.getRequestHeaders().entrySet()) {
                                           conn.setRequestProperty(h.getKey(), h.getValue());
                                       }
@@ -464,27 +492,52 @@ jobs:
                                           for (String sc : setCookies) CookieManager.getInstance().setCookie(urlStr, sc);
                                           CookieManager.getInstance().flush();
                                       }
+
+                                      // Manual redirect handling: resolve Location against the
+                                      // current URL (it may be relative or absolute), then hand it
+                                      // to the WebView as a brand-new top-level navigation. That
+                                      // re-enters this same method for the redirected URL, so the
+                                      // address bar / window.location / offline cache key all end up
+                                      // keyed on the REAL destination page, not the gateway URL.
+                                      if (code >= 300 && code < 400) {
+                                          String location = conn.getHeaderField("Location");
+                                          if (location != null) {
+                                              String resolved = new URL(new URL(urlStr), location).toString();
+                                              // Simple loop guard: if the chain of redirects starting
+                                              // from this navigation keeps bouncing without making
+                                              // progress, stop forwarding and fall through to whatever
+                                              // is cached instead of hammering the server forever.
+                                              if (resolved.equals(urlStr) || redirectHopCount(resolved) > MAX_REDIRECTS) {
+                                                  byte[] cachedLoop = offlineCacheGetBytes(urlStr);
+                                                  if (cachedLoop != null) {
+                                                      String cachedLoopMime = offlineCacheGetMime(urlStr);
+                                                      return new WebResourceResponse(cachedLoopMime != null ? cachedLoopMime : "text/html", "UTF-8", new ByteArrayInputStream(cachedLoop));
+                                                  }
+                                                  return null;
+                                              }
+                                              final String finalResolved = resolved;
+                                              runOnUiThread(() -> view.loadUrl(finalResolved));
+                                              // Swallow the original request with an empty response so
+                                              // WebView doesn't also try to render the 3xx body itself;
+                                              // the loadUrl() above is the navigation that actually
+                                              // counts, and it will report the correct final URL.
+                                              return new WebResourceResponse("text/plain", "UTF-8", new ByteArrayInputStream(new byte[0]));
+                                          }
+                                      }
+
                                       InputStream stream = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
                                       byte[] data = readAllBytes(stream);
                                       String contentType = conn.getContentType();
                                       String mime = (contentType != null && contentType.contains("/")) ? contentType.split(";")[0].trim() : "text/html";
                                       if (code >= 200 && code < 300) {
+                                          // urlStr is now always the REAL, final URL — redirects are
+                                          // no longer followed silently inside this connection (see
+                                          // fix above), so there is no separate "gateway URL" vs
+                                          // "final URL" to reconcile here anymore.
+                                          redirectHops.remove(urlStr);
                                           offlineCachePut(urlStr, mime, data);
-                                          // Bug fix ("close app, reopen offline -> lands on login"):
-                                          // urlStr is the ORIGINALLY requested URL (always the fixed
-                                          // gateway entry, e.g. /other_dashboard), but conn followed
-                                          // server-side redirects, so conn.getURL() is the REAL page
-                                          // that ended up rendering (e.g. /natural_dashboard, or /index
-                                          // for a guest). Cache under that real URL too, and remember
-                                          // it as "last successful page" — that pointer is what the
-                                          // offline path below trusts for the gateway URL, instead of
-                                          // only the gateway URL's own cache entry.
-                                          String finalUrl = (conn.getURL() != null) ? conn.getURL().toString() : urlStr;
-                                          if (!finalUrl.equals(urlStr)) {
-                                              offlineCachePut(finalUrl, mime, data);
-                                          }
                                           getSharedPreferences("realvision_prefs", MODE_PRIVATE)
-                                              .edit().putString("last_page_url", finalUrl).apply();
+                                              .edit().putString("last_page_url", urlStr).apply();
                                       }
                                       return new WebResourceResponse(mime, "UTF-8", new ByteArrayInputStream(data));
                                   } catch (Exception e) {
@@ -517,6 +570,17 @@ jobs:
                                       // custom content — the top banner (already shown) remains the
                                       // only offline indicator.
                                       return null;
+                                  } finally {
+                                      // Bug fix (connection leak): conn was previously never
+                                      // disconnected on either the success or the exception path.
+                                      // HttpURLConnection pools/holds sockets under the hood, so
+                                      // repeated navigation without this leaked one socket per page
+                                      // view — over a long session, this exhausted available
+                                      // connections and caused slowdowns or crashes. disconnect()
+                                      // here runs on every exit from the method (return or throw).
+                                      if (conn != null) {
+                                          conn.disconnect();
+                                      }
                                   }
                               }
                           });
@@ -1118,9 +1182,50 @@ jobs:
               }
 
               // 35a: Native share, callable from the web page as: AndroidShare.shareText("some text")
+              //
+              // Bug fix (unrestricted JS bridge): addJavascriptInterface() exposes this
+              // object to EVERY page the WebView ever loads into the same frame, not
+              // just the intended app domain — allowNavigation narrows which hosts the
+              // WebView will navigate to at all, but it does not stop a compromised or
+              // injected script on an already-loaded page (e.g. via a mixed-content
+              // resource, a malicious ad, or a future navigation bug) from calling
+              // window.AndroidShare directly. shareText() only launches a share sheet
+              // today, which is low severity, but the interface itself should never be
+              // trusted based on domain restriction alone. isCallOriginTrusted() re-checks
+              // the WebView's CURRENT top-level URL against the same allow-list at the
+              // moment of the call, so the bridge simply no-ops for any other origin.
+              private static final String[] TRUSTED_JS_BRIDGE_HOSTS = {
+                  "realvisionacademy.site.je"
+              };
+
+              private boolean isCallOriginTrusted() {
+                  try {
+                      WebView webView = this.bridge != null ? this.bridge.getWebView() : null;
+                      String currentUrl = webView != null ? webView.getUrl() : null;
+                      if (currentUrl == null) return false;
+                      // "localhost" covers the bundled www/index.html gateway shell, which
+                      // Capacitor serves under androidScheme "https" at https://localhost —
+                      // it never calls the bridge itself, but is included so a fresh cold
+                      // start (before the live page has loaded) doesn't spuriously log a
+                      // rejected call.
+                      String host = Uri.parse(currentUrl).getHost();
+                      if (host == null) return false;
+                      if (host.equals("localhost")) return true;
+                      for (String trusted : TRUSTED_JS_BRIDGE_HOSTS) {
+                          if (host.equals(trusted) || host.endsWith("." + trusted)) return true;
+                      }
+                      return false;
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+
               private class WebAppInterface {
                   @JavascriptInterface
                   public void shareText(String text) {
+                      if (!isCallOriginTrusted()) {
+                          return;
+                      }
                       runOnUiThread(() -> {
                           try {
                               Intent shareIntent = new Intent(Intent.ACTION_SEND);
@@ -1234,14 +1339,140 @@ jobs:
               f.write(content)
           PYEOF
 
-      - name: Build Debug APK
+      # Bug fix (debug-only APK): assembleDebug alone produced an artifact that:
+      #   - is signed with the auto-generated Android debug key, which Google Play
+      #     refuses to accept — there was no path from this workflow to a
+      #     Play-Store-installable build at all;
+      #   - ships with android:debuggable=true (set implicitly by the "debug"
+      #     build type), which defeats the root/USB-debug/emulator warnings and
+      #     FLAG_SECURE screenshot block added in MainActivity — a debuggable
+      #     build can be attached to and inspected regardless of those checks;
+      #   - has no ProGuard/R8 shrinking or obfuscation, so the compiled APK is
+      #     trivial to decompile and read as close-to-source Java.
+      # This step configures a real release build type instead: minifyEnabled +
+      # shrinkResources (R8) and a signing config sourced from repo secrets, so
+      # the same workflow produces a Play-Store-ready artifact. It requires four
+      # repository secrets to be set beforehand (Settings -> Secrets and
+      # variables -> Actions):
+      #   ANDROID_KEYSTORE_BASE64  - `base64 -w0 your-release.jks` output
+      #   ANDROID_KEYSTORE_PASSWORD
+      #   ANDROID_KEY_ALIAS
+      #   ANDROID_KEY_PASSWORD
+      # If those secrets are not present (e.g. a contributor's fork, or a quick
+      # smoke-test run), this step is skipped and the fallback debug step below
+      # runs instead, so the workflow still succeeds end-to-end without them —
+      # it just won't produce a store-ready artifact in that case.
+      - name: Configure release signing + minification
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        if: ${{ env.KEYSTORE_BASE64 != '' }}
         run: |
+          echo "has_secrets=true" >> "$GITHUB_OUTPUT"
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/release.keystore
+
+          # Baseline ProGuard/R8 keep rules. Capacitor's own consumer rules
+          # already cover its plugins, but the JavascriptInterface bridge added
+          # in MainActivity.java (WebAppInterface / AndroidShare) is app code
+          # R8 doesn't know is called from JS — without an explicit keep rule,
+          # minification can rename or strip shareText(), which would silently
+          # break the web page's AndroidShare.shareText(...) calls only in the
+          # release build (never seen in the unobfuscated debug build).
+          cat >> android/app/proguard-rules.pro << 'PROEOF'
+
+          # Keep any @JavascriptInterface-annotated methods reachable from the
+          # WebView's JS bridge — R8 has no static reference to these calls.
+          -keepclassmembers class * {
+              @android.webkit.JavascriptInterface <methods>;
+          }
+          -keep class com.realvisionacademy.app.MainActivity$WebAppInterface { *; }
+          PROEOF
+
+          python3 << 'PYEOF'
+          import re
+
+          path = "android/app/build.gradle"
+          with open(path) as f:
+              content = f.read()
+
+          signing_block = '''
+              signingConfigs {
+                  release {
+                      storeFile file("release.keystore")
+                      storePassword System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                      keyAlias System.getenv("ANDROID_KEY_ALIAS")
+                      keyPassword System.getenv("ANDROID_KEY_PASSWORD")
+                  }
+              }
+          '''
+
+          if 'signingConfigs' not in content:
+              content = re.sub(
+                  r'(android\s*\{)',
+                  r'\1' + signing_block,
+                  content,
+                  count=1
+              )
+
+          # Replace the default (unsigned, unminified) release build type with
+          # one that shrinks/obfuscates and signs with the config above. Falls
+          # back to inserting a release block if the template didn't ship one.
+          release_type = '''release {
+                      minifyEnabled true
+                      shrinkResources true
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+                      signingConfig signingConfigs.release
+                  }'''
+
+          if re.search(r'release\s*\{[^}]*\}', content, flags=re.DOTALL):
+              content = re.sub(
+                  r'release\s*\{[^}]*\}',
+                  release_type,
+                  content,
+                  count=1,
+                  flags=re.DOTALL
+              )
+          else:
+              content = re.sub(
+                  r'(buildTypes\s*\{)',
+                  r'\1\n            ' + release_type,
+                  content,
+                  count=1
+              )
+
+          with open(path, 'w') as f:
+              f.write(content)
+          PYEOF
+
+      - name: Build Release APK (signed + minified)
+        if: ${{ steps.signing.outputs.has_secrets == 'true' }}
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Fallback - Build Debug APK (no signing secrets configured)
+        if: ${{ steps.signing.outputs.has_secrets != 'true' }}
+        run: |
+          echo "::warning::ANDROID_KEYSTORE_BASE64 and friends are not set as repo secrets — building an unsigned debug APK instead. This is NOT suitable for Play Store upload."
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug
 
-      - name: Upload APK
+      - name: Upload Release APK
+        if: ${{ steps.signing.outputs.has_secrets == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: realvision-app-apk
+          name: realvision-app-apk-release
+          path: android/app/build/outputs/apk/release/app-release.apk
+
+      - name: Upload Debug APK (fallback)
+        if: ${{ steps.signing.outputs.has_secrets != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: realvision-app-apk-debug
           path: android/app/build/outputs/apk/debug/app-debug.apk
