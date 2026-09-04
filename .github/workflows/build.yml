@@ -2087,27 +2087,22 @@ jobs:
           with open(path) as f:
               content = f.read()
 
-          signing_block = '''
-              signingConfigs {
-                  release {
-                      storeFile file("release.keystore")
-                      storePassword System.getenv("ANDROID_KEYSTORE_PASSWORD")
-                      keyAlias System.getenv("ANDROID_KEY_ALIAS")
-                      keyPassword System.getenv("ANDROID_KEY_PASSWORD")
-                  }
-              }
-          '''
-
-          if 'signingConfigs' not in content:
-              content = re.sub(
-                  r'(android\s*\{)',
-                  r'\1' + signing_block,
-                  content,
-                  count=1
-              )
+          # Bug fix (signing block corrupted buildTypes.release): these two used to run
+          # in the opposite order — signingConfigs inserted FIRST, then a regex looking
+          # for "release {...}" to add minifyEnabled/shrinkResources/signingConfig to.
+          # Since signingConfigs.release also contains a "release {...}" block, and it
+          # now appeared earlier in the file than buildTypes.release, that regex (which
+          # only takes the FIRST match) grabbed the wrong one — it rewrote
+          # signingConfigs.release's contents into minifyEnabled/shrinkResources/etc,
+          # which Gradle then rejected with "Could not find method minifyEnabled() ...
+          # on SigningConfig" (and left buildTypes.release untouched, corrupting the
+          # surrounding android{} block enough to also lose compileSdkVersion). Doing the
+          # buildTypes.release rewrite FIRST — while it's still the only "release {...}"
+          # block in the file — then inserting signingConfigs afterward, means the regex
+          # can never match the wrong block.
 
           # Replace the default (unsigned, unminified) release build type with
-          # one that shrinks/obfuscates and signs with the config above. Falls
+          # one that shrinks/obfuscates and signs with the config below. Falls
           # back to inserting a release block if the template didn't ship one.
           release_type = '''release {
                       minifyEnabled true
@@ -2128,6 +2123,25 @@ jobs:
               content = re.sub(
                   r'(buildTypes\s*\{)',
                   r'\1\n            ' + release_type,
+                  content,
+                  count=1
+              )
+
+          signing_block = '''
+              signingConfigs {
+                  release {
+                      storeFile file("release.keystore")
+                      storePassword System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                      keyAlias System.getenv("ANDROID_KEY_ALIAS")
+                      keyPassword System.getenv("ANDROID_KEY_PASSWORD")
+                  }
+              }
+          '''
+
+          if 'signingConfigs' not in content:
+              content = re.sub(
+                  r'(android\s*\{)',
+                  r'\1' + signing_block,
                   content,
                   count=1
               )
