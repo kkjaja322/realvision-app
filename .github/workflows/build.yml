@@ -186,6 +186,10 @@ jobs:
               private ConnectivityManager.NetworkCallback networkCallback;
               private final Handler connectivityHandler = new Handler(Looper.getMainLooper());
               private boolean vpnDialogShowing = false;
+              // 43a: Guards the offline "page not available" dialog (Close/Retry) added
+              // below, so a burst of taps on not-yet-cached links can't stack multiple
+              // copies of the same dialog on screen at once.
+              private boolean offlineDialogShowing = false;
               // Backing signal for feature 43 below — refreshed by checkRealInternet()
               // (on launch, every 10s, and on every network change), so it's more reliable
               // than the instantaneous isNetworkAvailable() check alone (that one only knows
@@ -235,10 +239,25 @@ jobs:
                           String ua = settings.getUserAgentString();
                           settings.setUserAgentString(ua + " RealVisionApp/1.0");
 
-                          // 11-12: Long-press / text-select disable
-                          webView.setLongClickable(false);
+                          // 11-12: Long-press disabled for content protection (stops copying
+                          // lesson text, images, etc.) — EXCEPT on editable text fields, where
+                          // it must stay enabled or Android's native Paste / paste-suggestion
+                          // strip never appears. This is what breaks pasting an email
+                          // verification / OTP code into a blank input box if left blanket-
+                          // disabled. WebView.HitTestResult reports EDIT_TEXT_TYPE only when
+                          // the long-press lands on a focused, editable <input>/<textarea>, so
+                          // we selectively let Android handle just those long-presses natively.
+                          webView.setLongClickable(true);
                           webView.setHapticFeedbackEnabled(false);
-                          webView.setOnLongClickListener(v -> true);
+                          webView.setOnLongClickListener(v -> {
+                              WebView.HitTestResult result = webView.getHitTestResult();
+                              if (result != null && result.getType() == WebView.HitTestResult.EDIT_TEXT_TYPE) {
+                                  // Don't consume the event — let Android show its native
+                                  // Paste / paste-suggestion toolbar for this field.
+                                  return false;
+                              }
+                              return true;
+                          });
 
                           // 13: Overscroll/bounce disable
                           webView.setOverScrollMode(WebView.OVER_SCROLL_NEVER);
@@ -381,9 +400,29 @@ jobs:
                               // this, that scenario could leave the bar frozen at ~90% forever.
                               @Override
                               public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-                                  super.onReceivedError(view, request, error);
+                                  // Deliberately NOT calling super.onReceivedError(...) — on some
+                                  // WebView/OEM versions the default implementation is what paints
+                                  // Chromium's own "net::ERR_NAME_NOT_RESOLVED" page. This callback
+                                  // should be unreachable for main-frame live-domain GETs (they're
+                                  // fully handled by shouldInterceptRequest above and never touch
+                                  // WebView's own network stack), but if any edge case ever does
+                                  // land here, we immediately paint our own branded page over it
+                                  // instead of risking the native one showing even for a frame.
                                   if (request != null && request.isForMainFrame()) {
                                       finishLoadingProgress();
+                                      view.loadDataWithBaseURL(null, offlineFallbackHtml(), "text/html", "UTF-8", null);
+                                  }
+                              }
+
+                              @Override
+                              public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse errorResponse) {
+                                  // Same reasoning as onReceivedError above, for HTTP-level errors
+                                  // (4xx/5xx) instead of connection-level ones. Also effectively
+                                  // unreachable for the intercepted live-domain flow, kept only as
+                                  // a second safety net so no raw browser error screen can appear.
+                                  if (request != null && request.isForMainFrame()) {
+                                      finishLoadingProgress();
+                                      view.loadDataWithBaseURL(null, offlineFallbackHtml(), "text/html", "UTF-8", null);
                                   }
                               }
 
@@ -431,7 +470,10 @@ jobs:
                                       boolean offline = !isNetworkAvailable() || !hasRealInternetSignal;
                                       boolean hasCache = offlineCacheGetBytes(urlStr) != null;
                                       if (offline && !hasCache) {
-                                          runOnUiThread(() -> setBanner(offlineBannerText(), true));
+                                          runOnUiThread(() -> {
+                                              setBanner(offlineBannerText(), true);
+                                              showOfflineUnavailableDialog(view, urlStr);
+                                          });
                                           return true;
                                       }
                                   }
@@ -563,29 +605,12 @@ jobs:
                                       // looked reachable at pre-flight but failed once actually sent),
                                       // or a cold start with zero cache at all — so instead of letting
                                       // WebView show its raw browser error, we hand back our own
-                                      // branded "not saved offline" page.
-                                      String offlineHtml = "<!DOCTYPE html><html lang=\"am\"><head>"
-                                          + "<meta charset=\"UTF-8\">"
-                                          + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
-                                          + "<style>"
-                                          + "*{box-sizing:border-box;margin:0;padding:0;}"
-                                          + "html,body{height:100%;background:#0f172a;color:#f1f5f9;"
-                                          + "font-family:-apple-system,Roboto,'Noto Sans Ethiopic','Nyala',sans-serif;}"
-                                          + "#wrap{min-height:100%;display:flex;flex-direction:column;"
-                                          + "align-items:center;justify-content:center;text-align:center;padding:32px 24px;}"
-                                          + ".icon{font-size:48px;margin-bottom:18px;}"
-                                          + "h1{font-size:18px;font-weight:700;margin-bottom:10px;}"
-                                          + "p{color:#94a3b8;font-size:14px;max-width:320px;line-height:1.6;margin-bottom:24px;}"
-                                          + "button{background:#3b82f6;color:#fff;border:none;padding:12px 28px;"
-                                          + "border-radius:10px;font-size:15px;font-weight:600;}"
-                                          + "</style></head><body><div id=\"wrap\">"
-                                          + "<div class=\"icon\">📡</div>"
-                                          + "<h1>ገፁ አልተገኘም</h1>"
-                                          + "<p>ይህንን ገፅ online ላይ ሆነው አልተጠቀሙትም ስለዚህ ይመለሱ።</p>"
-                                          + "<button onclick=\"history.back()\">ተመለስ</button>"
-                                          + "</div></body></html>";
+                                      // branded "not saved offline" page. Shared with onReceivedError
+                                      // below via offlineFallbackHtml() so there is exactly one place
+                                      // Chromium's native error UI could ever slip through, and it's
+                                      // covered too.
                                       return new WebResourceResponse("text/html", "UTF-8",
-                                          new ByteArrayInputStream(offlineHtml.getBytes(StandardCharsets.UTF_8)));
+                                          new ByteArrayInputStream(offlineFallbackHtml().getBytes(StandardCharsets.UTF_8)));
                                   } finally {
                                       // Bug fix (connection leak): conn was previously never
                                       // disconnected on either the success or the exception path.
@@ -731,6 +756,34 @@ jobs:
                   int n;
                   while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
                   return out.toByteArray();
+              }
+
+              // 44a: Single source of truth for the branded "not saved offline" page.
+              // Used by shouldInterceptRequest's catch-block AND by onReceivedError below
+              // — together these two are the only two places a failed load can end up, so
+              // sharing this guarantees Chromium's own net::ERR_* error screen is never the
+              // thing the student actually sees.
+              private String offlineFallbackHtml() {
+                  return "<!DOCTYPE html><html lang=\"am\"><head>"
+                      + "<meta charset=\"UTF-8\">"
+                      + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
+                      + "<style>"
+                      + "*{box-sizing:border-box;margin:0;padding:0;}"
+                      + "html,body{height:100%;background:#0f172a;color:#f1f5f9;"
+                      + "font-family:-apple-system,Roboto,'Noto Sans Ethiopic','Nyala',sans-serif;}"
+                      + "#wrap{min-height:100%;display:flex;flex-direction:column;"
+                      + "align-items:center;justify-content:center;text-align:center;padding:32px 24px;}"
+                      + ".icon{font-size:48px;margin-bottom:18px;}"
+                      + "h1{font-size:18px;font-weight:700;margin-bottom:10px;}"
+                      + "p{color:#94a3b8;font-size:14px;max-width:320px;line-height:1.6;margin-bottom:24px;}"
+                      + "button{background:#3b82f6;color:#fff;border:none;padding:12px 28px;"
+                      + "border-radius:10px;font-size:15px;font-weight:600;}"
+                      + "</style></head><body><div id=\"wrap\">"
+                      + "<div class=\"icon\">📡</div>"
+                      + "<h1>ገፁ አልተገኘም</h1>"
+                      + "<p>ይህንን ገፅ online ላይ ሆነው አልተጠቀሙትም ስለዚህ ይመለሱ።</p>"
+                      + "<button onclick=\"history.back()\">ተመለስ</button>"
+                      + "</div></body></html>";
               }
 
 
@@ -974,6 +1027,55 @@ jobs:
                       .setNegativeButton("No", (dialog, which) -> {
                           vpnDialogShowing = false;
                           finish();
+                      })
+                      .show();
+              }
+
+              // 43b: Shown instead of navigating when the student is offline AND the
+              // tapped page was never opened while online (so there is nothing saved to
+              // show them). Two explicit choices only, no silent behavior:
+              //   Close  -> just dismiss, student stays exactly where they were.
+              //   Retry  -> re-check the network right now and, if it's actually back,
+              //             immediately re-attempt the same navigation; otherwise the
+              //             dialog reappears so the student knows the retry itself failed.
+              private void showOfflineUnavailableDialog(WebView view, String targetUrl) {
+                  if (offlineDialogShowing || isFinishing()) return;
+                  offlineDialogShowing = true;
+                  new AlertDialog.Builder(this)
+                      .setTitle("Not Available Offline / ከመስመር ውጭ አይገኝም")
+                      .setMessage("ይህንን ገፅ online ሆነው ስላልተጠቀሙበት አሁን ከመስመር ውጭ ሆነው መክፈት አይችሉም።\n\n" +
+                          "You can't use this because you haven't used it while online.")
+                      .setCancelable(false)
+                      .setPositiveButton("Retry", (dialog, which) -> {
+                          offlineDialogShowing = false;
+                          // Force a fresh check instead of trusting the last periodic probe,
+                          // so tapping Retry right after Wi-Fi/data comes back doesn't get
+                          // rejected again on stale state.
+                          new Thread(() -> {
+                              boolean reachable;
+                              try {
+                                  java.net.Socket socket = new java.net.Socket();
+                                  socket.connect(new java.net.InetSocketAddress("google.com", 443), 2500);
+                                  socket.close();
+                                  reachable = true;
+                              } catch (Exception e) {
+                                  reachable = false;
+                              }
+                              hasRealInternetSignal = reachable;
+                              final boolean isBackOnline = reachable && isNetworkAvailable();
+                              runOnUiThread(() -> {
+                                  if (isBackOnline) {
+                                      setBanner(null, false);
+                                      view.loadUrl(targetUrl);
+                                  } else {
+                                      setBanner(offlineBannerText(), true);
+                                      showOfflineUnavailableDialog(view, targetUrl);
+                                  }
+                              });
+                          }).start();
+                      })
+                      .setNegativeButton("Close", (dialog, which) -> {
+                          offlineDialogShowing = false;
                       })
                       .show();
               }
