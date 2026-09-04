@@ -40,6 +40,19 @@ jobs:
             },
             "android": {
               "allowMixedContent": false
+            },
+            "plugins": {
+              "SplashScreen": {
+                "launchShowDuration": 1200,
+                "launchAutoHide": true,
+                "launchFadeOutDuration": 350,
+                "backgroundColor": "#0b0518",
+                "showSpinner": true,
+                "spinnerColor": "#3b82f6",
+                "androidSpinnerStyle": "large",
+                "splashFullScreen": true,
+                "splashImmersive": true
+              }
             }
           }
           CAPEOF
@@ -110,6 +123,88 @@ jobs:
       - name: Sync Capacitor
         run: npx cap sync android
 
+      - name: Add extra Android dependencies (biometric lock)
+        run: |
+          python3 << 'PYEOF'
+          import re
+
+          path = "android/app/build.gradle"
+          with open(path) as f:
+              content = f.read()
+
+          # Adds AndroidX Biometric, used by the app-lock / session-timeout feature
+          # in MainActivity.java below. Only inserted if not already present, so
+          # re-running this workflow never duplicates the dependency line.
+          if 'androidx.biometric:biometric' not in content:
+              content = re.sub(
+                  r'(dependencies\s*\{)',
+                  r'\1\n    implementation "androidx.biometric:biometric:1.1.0"',
+                  content,
+                  count=1
+              )
+
+          with open(path, 'w') as f:
+              f.write(content)
+          PYEOF
+
+      - name: Create app shortcuts (long-press icon menu)
+        run: |
+          mkdir -p android/app/src/main/res/xml
+          # Static shortcuts shown on long-press of the app icon. Each points at
+          # a deep-link URL that MainActivity reads on launch (see
+          # SHORTCUT_URL_EXTRA handling below) and loads directly, instead of
+          # always landing on the default dashboard gateway. Icons reuse the
+          # app's own launcher icon set that Capacitor already generates, so
+          # no extra artwork is required.
+          cat > android/app/src/main/res/xml/shortcuts.xml << 'SHORTCUTEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+              <shortcut
+                  android:shortcutId="dashboard"
+                  android:enabled="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:shortcutShortLabel="@string/shortcut_dashboard_short"
+                  android:shortcutLongLabel="@string/shortcut_dashboard_long">
+                  <intent
+                      android:action="android.intent.action.VIEW"
+                      android:targetPackage="com.realvisionacademy.app"
+                      android:targetClass="com.realvisionacademy.app.MainActivity">
+                      <extra android:name="shortcut_url" android:value="https://realvisionacademy.site.je/other_dashboard" />
+                  </intent>
+              </shortcut>
+              <shortcut
+                  android:shortcutId="quiz"
+                  android:enabled="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:shortcutShortLabel="@string/shortcut_quiz_short"
+                  android:shortcutLongLabel="@string/shortcut_quiz_long">
+                  <intent
+                      android:action="android.intent.action.VIEW"
+                      android:targetPackage="com.realvisionacademy.app"
+                      android:targetClass="com.realvisionacademy.app.MainActivity">
+                      <extra android:name="shortcut_url" android:value="https://realvisionacademy.site.je/question_bank" />
+                  </intent>
+              </shortcut>
+          </shortcuts>
+          SHORTCUTEOF
+
+          python3 << 'PYEOF'
+          import re
+          path = "android/app/src/main/res/values/strings.xml"
+          with open(path) as f:
+              content = f.read()
+          extra = (
+              '    <string name="shortcut_dashboard_short">Dashboard</string>\n'
+              '    <string name="shortcut_dashboard_long">Open my dashboard</string>\n'
+              '    <string name="shortcut_quiz_short">Quiz</string>\n'
+              '    <string name="shortcut_quiz_long">Open question bank</string>\n'
+          )
+          if 'shortcut_dashboard_short' not in content:
+              content = content.replace('</resources>', extra + '</resources>')
+          with open(path, 'w') as f:
+              f.write(content)
+          PYEOF
+
       - name: Write full MainActivity.java (35+ native features)
         run: |
           FILE=$(find android -name MainActivity.java)
@@ -125,6 +220,7 @@ jobs:
           import android.content.Intent;
           import android.content.SharedPreferences;
           import android.content.pm.PackageInfo;
+          import android.content.res.Configuration;
           import android.graphics.Color;
           import android.net.ConnectivityManager;
           import android.net.Network;
@@ -153,10 +249,15 @@ jobs:
           import android.webkit.WebResourceResponse;
           import android.webkit.WebSettings;
           import android.webkit.WebView;
+          import android.widget.Button;
           import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
           import android.widget.ProgressBar;
           import android.widget.TextView;
           import android.widget.Toast;
+          import androidx.biometric.BiometricManager;
+          import androidx.biometric.BiometricPrompt;
+          import androidx.core.content.ContextCompat;
           import com.getcapacitor.BridgeActivity;
           import com.getcapacitor.BridgeWebViewClient;
           import org.json.JSONObject;
@@ -174,6 +275,10 @@ jobs:
           import java.security.MessageDigest;
           import java.util.List;
           import java.util.Map;
+          import java.util.concurrent.Executor;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.atomic.AtomicInteger;
 
           public class MainActivity extends BridgeActivity {
 
@@ -202,6 +307,27 @@ jobs:
                       connectivityHandler.postDelayed(this, 10000);
                   }
               };
+
+              // --- 45: Biometric app-lock + session timeout -------------------------
+              // If the app was backgrounded for longer than this, require the
+              // device's fingerprint/face/PIN before showing content again on resume.
+              private static final long SESSION_TIMEOUT_MS = 5 * 60 * 1000L; // 5 minutes
+              private long lastBackgroundedAt = 0L;
+              private View lockOverlay;
+              private boolean lockOverlayShowing = false;
+              private final Executor biometricExecutor = Executors.newSingleThreadExecutor();
+
+              // --- 46: Pull-to-refresh state ------------------------------------------
+              private View pullIndicator;
+              private float pullStartY = -1f;
+              private boolean pullTracking = false;
+              private static final float PULL_TRIGGER_DP = 90f;
+
+              // --- 47: Soft (non-forced) update banner --------------------------------
+              private View softUpdateBanner;
+
+              // --- 50: Download-all-pages (native offline pre-fetch) ------------------
+              private ExecutorService offlineDownloadPool;
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
@@ -279,12 +405,26 @@ jobs:
                           settings.setRenderPriority(WebSettings.RenderPriority.HIGH);
 
                           // 35: Native share bridge — call from web page via AndroidShare.shareText("...")
-                          webView.addJavascriptInterface(new WebAppInterface(), "AndroidShare");
+                          WebAppInterface webAppInterface = new WebAppInterface();
+                          webView.addJavascriptInterface(webAppInterface, "AndroidShare");
+                          // 50: Same bridge object, registered under a second name too, so the
+                          // website's JS can call AndroidOffline.downloadAllPages() /
+                          // .getDownloadedPageCount() / .getTotalPageCount() without needing to
+                          // know it happens to share a class with the share-sheet bridge.
+                          webView.addJavascriptInterface(webAppInterface, "AndroidOffline");
 
                           // 40: Chrome-style top loading bar — shown on onPageStarted / hidden on
                           // onPageFinished below (added to the same WebViewClient override, next
                           // to feature 39, so a single navigation callback drives both).
                           setupTopProgressBar();
+
+                          // 46a: Pull-to-refresh spinner, pinned to the top, hidden until the
+                          // student actually drags down from the very top of the page.
+                          setupPullIndicator();
+
+                          // 47a: Dismissible "new version available" bar for optional updates —
+                          // separate from the blocking dialog used for forceUpdate=true.
+                          setupSoftUpdateBanner();
 
                           // 41: Double-tap anywhere on the page to refresh. Safe to bind directly
                           // to touch events because zoom is disabled (settings.setSupportZoom
@@ -341,6 +481,7 @@ jobs:
                           });
                           webView.setOnTouchListener((v, event) -> {
                               doubleTapDetector.onTouchEvent(event);
+                              handlePullToRefreshTouch(webView, event);
                               return false;
                           });
 
@@ -391,6 +532,20 @@ jobs:
                               public void onPageFinished(WebView view, String url) {
                                   super.onPageFinished(view, url);
                                   finishLoadingProgress();
+                                  // 49: Native dark-mode signal. We can't force the web page's
+                                  // theme — only realvisionacademy.site.je's own CSS/JS decides
+                                  // what to do with this — but every page load now tells it what
+                                  // the phone's system theme currently is, via a data-attribute
+                                  // on <html>. If/when the site adds a rule like
+                                  // [data-native-theme="dark"] { ... }, it'll pick this up for
+                                  // free with zero further native changes needed.
+                                  boolean isDark = (getResources().getConfiguration().uiMode
+                                          & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+                                  String theme = isDark ? "dark" : "light";
+                                  view.evaluateJavascript(
+                                      "document.documentElement.setAttribute('data-native-theme','" + theme + "');",
+                                      null
+                                  );
                               }
 
                               // 40a: Safety net for the top progress bar. onPageFinished is not
@@ -658,9 +813,52 @@ jobs:
 
                       // 38: App-rating prompt after a few launches
                       maybePromptRating();
+
+                      // 45a: Prepare (hidden) the biometric lock overlay used by the
+                      // session-timeout check in onResume below.
+                      setupLockOverlay();
+
+                      // 48: Handle a tap on a long-press app shortcut (e.g. "Quiz") that
+                      // cold-started the app — jumps straight to that shortcut's URL
+                      // instead of the default dashboard gateway.
+                      handleShortcutIntent(getIntent());
                   } catch (Exception e) {
                       e.printStackTrace();
                   }
+              }
+
+              @Override
+              protected void onNewIntent(Intent intent) {
+                  super.onNewIntent(intent);
+                  // 48a: App shortcut tapped while the app was already running (not a
+                  // cold start) — same handling, just re-entered via onNewIntent instead.
+                  setIntent(intent);
+                  handleShortcutIntent(intent);
+              }
+
+              // 48b: Reads the "shortcut_url" extra set by res/xml/shortcuts.xml (see the
+              // "Create app shortcuts" build step) and, if present, navigates straight
+              // there instead of the default gateway page.
+              private void handleShortcutIntent(Intent intent) {
+                  try {
+                      if (intent == null) return;
+                      String shortcutUrl = intent.getStringExtra("shortcut_url");
+                      if (shortcutUrl == null || shortcutUrl.isEmpty()) return;
+                      WebView webView = this.bridge != null ? this.bridge.getWebView() : null;
+                      if (webView != null) {
+                          webView.postDelayed(() -> webView.loadUrl(shortcutUrl), 300);
+                      }
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  // 45b: Timestamp the moment the app leaves the foreground — checked in
+                  // onResume below to decide whether re-authentication is required.
+                  lastBackgroundedAt = System.currentTimeMillis();
               }
 
               @Override
@@ -669,6 +867,15 @@ jobs:
                   try {
                       // 34a: Re-check VPN when returning from Settings
                       checkVpnAndPrompt();
+
+                      // 45c: If the app was backgrounded longer than SESSION_TIMEOUT_MS,
+                      // require biometric/device-credential auth before showing content
+                      // again. lastBackgroundedAt == 0 means this is the very first
+                      // onResume right after onCreate (cold start) — never lock then.
+                      if (lastBackgroundedAt != 0
+                              && System.currentTimeMillis() - lastBackgroundedAt >= SESSION_TIMEOUT_MS) {
+                          requireReAuthentication();
+                      }
                   } catch (Exception e) {
                       e.printStackTrace();
                   }
@@ -756,6 +963,62 @@ jobs:
                   int n;
                   while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
                   return out.toByteArray();
+              }
+
+              // --- 50: Download-all-pages (native offline pre-fetch) -----------------
+              // Same student-facing page set sw.js precaches on the web side, kept here
+              // so the app can proactively warm offlineCachePut() for all of them at once
+              // (instead of relying on the student having opened each one already).
+              private static final String[] OFFLINE_PAGE_LIST = new String[] {
+                  "other_dashboard", "homepage.php", "about.php", "achievements.php",
+                  "adaptive_learning.php", "ai_tutor.php", "ask_teacher.php", "book_marks.php",
+                  "calendar_sync.php", "career_guide.php", "certificates.php", "challenges.php",
+                  "chapter_formulas_public.php", "chapter_notes.php", "courses.php",
+                  "daily_challenge.php", "exam_tips.php", "flashcards.php", "formula_view.php",
+                  "formulas.php", "forum.php", "language.php", "leaderboard.php",
+                  "live_classes.php", "mock_exam.php", "my_notes.php", "notifications.php",
+                  "past_exams.php", "payment_history.php", "practice.php", "profile.php",
+                  "progress_report.php", "question_bank.php", "recommendations.php",
+                  "rewards_store.php", "security.php", "settings.php", "student_view_note.php",
+                  "study_buddy.php", "study_groups.php", "study_planner.php", "subscription.php",
+                  "support_chat.php", "time_analytics.php", "university_guide.php",
+                  "video_lessons.php", "vocabulary.php", "wallet.php", "your_id.php"
+              };
+
+              // Fetches one page over HTTP and writes it into the same native offline
+              // cache shouldInterceptRequest reads from — so once this has run, opening
+              // any of these pages offline works exactly as if the student had visited
+              // it live first. Follows redirects automatically (unlike
+              // shouldInterceptRequest's manual hop-by-hop handling above) since there is
+              // no live WebView navigation here to keep in sync with the final URL —
+              // only the resulting bytes matter, cached under both URLs just in case.
+              private boolean fetchAndCachePage(String urlStr) {
+                  HttpURLConnection conn = null;
+                  try {
+                      conn = (HttpURLConnection) new URL(urlStr).openConnection();
+                      conn.setConnectTimeout(8000);
+                      conn.setReadTimeout(12000);
+                      conn.setInstanceFollowRedirects(true);
+                      String cookie = CookieManager.getInstance().getCookie(urlStr);
+                      if (cookie != null) conn.setRequestProperty("Cookie", cookie);
+
+                      int code = conn.getResponseCode();
+                      if (code < 200 || code >= 300) return false;
+
+                      byte[] data = readAllBytes(conn.getInputStream());
+                      String contentType = conn.getContentType();
+                      String mime = (contentType != null && contentType.contains("/"))
+                          ? contentType.split(";")[0].trim() : "text/html";
+
+                      offlineCachePut(urlStr, mime, data);
+                      String finalUrl = conn.getURL().toString();
+                      if (!finalUrl.equals(urlStr)) offlineCachePut(finalUrl, mime, data);
+                      return true;
+                  } catch (Exception e) {
+                      return false;
+                  } finally {
+                      if (conn != null) conn.disconnect();
+                  }
               }
 
               // 44a: Single source of truth for the branded "not saved offline" page.
@@ -1228,6 +1491,11 @@ jobs:
 
                           if (forceUpdate && latestVersionCode > currentVersionCode) {
                               runOnUiThread(() -> showForceUpdateDialog(storeUrl));
+                          } else if (latestVersionCode > currentVersionCode) {
+                              // 47b: A newer version exists but the server didn't mark it as
+                              // mandatory — show the small dismissible bottom bar instead of
+                              // the blocking dialog, so students aren't interrupted.
+                              runOnUiThread(() -> showSoftUpdateBanner(storeUrl));
                           }
                       } catch (Exception e) {
                           e.printStackTrace();
@@ -1355,6 +1623,290 @@ jobs:
                           }
                       });
                   }
+
+                  // 50: Kicks off downloading every page in OFFLINE_PAGE_LIST in the
+                  // background, 4 at a time. Progress/result are pushed back to the page
+                  // via window.onOfflineDownloadProgress(done,total,failed) and
+                  // window.onOfflineDownloadComplete(downloaded,total,failed) — define
+                  // those two functions on the web side to drive a progress bar/toast.
+                  // Ignored if a download is already running, so a double-tap on the
+                  // button can't start two overlapping runs.
+                  @JavascriptInterface
+                  public void downloadAllPages() {
+                      if (!isCallOriginTrusted()) {
+                          return;
+                      }
+                      if (offlineDownloadPool != null && !offlineDownloadPool.isShutdown()) {
+                          return;
+                      }
+                      offlineDownloadPool = Executors.newFixedThreadPool(4);
+                      final int total = OFFLINE_PAGE_LIST.length;
+                      final AtomicInteger done = new AtomicInteger(0);
+                      final AtomicInteger failed = new AtomicInteger(0);
+
+                      for (String path : OFFLINE_PAGE_LIST) {
+                          final String url = "https://realvisionacademy.site.je/" + path;
+                          offlineDownloadPool.execute(() -> {
+                              boolean ok = fetchAndCachePage(url);
+                              int d = done.incrementAndGet();
+                              if (!ok) failed.incrementAndGet();
+                              final int f = failed.get();
+                              runOnUiThread(() -> webView.evaluateJavascript(
+                                  "window.onOfflineDownloadProgress && window.onOfflineDownloadProgress("
+                                      + d + "," + total + "," + f + ");",
+                                  null
+                              ));
+                              if (d == total) {
+                                  final int finalFailed = failed.get();
+                                  runOnUiThread(() -> webView.evaluateJavascript(
+                                      "window.onOfflineDownloadComplete && window.onOfflineDownloadComplete("
+                                          + (total - finalFailed) + "," + total + "," + finalFailed + ");",
+                                      null
+                                  ));
+                                  offlineDownloadPool.shutdown();
+                              }
+                          });
+                      }
+                  }
+
+                  // How many of OFFLINE_PAGE_LIST are already saved offline right now —
+                  // lets the web side show "12/49 pages downloaded" on page load, before
+                  // the student has tapped the download button this session.
+                  @JavascriptInterface
+                  public int getDownloadedPageCount() {
+                      if (!isCallOriginTrusted()) {
+                          return 0;
+                      }
+                      int count = 0;
+                      for (String path : OFFLINE_PAGE_LIST) {
+                          String url = "https://realvisionacademy.site.je/" + path;
+                          if (offlineCacheGetBytes(url) != null) count++;
+                      }
+                      return count;
+                  }
+
+                  @JavascriptInterface
+                  public int getTotalPageCount() {
+                      return OFFLINE_PAGE_LIST.length;
+                  }
+              }
+
+              // ======================================================================
+              // 45: Biometric app-lock + session timeout
+              // ======================================================================
+
+              // Builds (once) a full-screen, non-dismissable overlay that hides the
+              // WebView behind a solid background + "Unlock" button while a biometric
+              // check is pending — combined with FLAG_SECURE above, this also means a
+              // backgrounded/recent-apps preview never shows the last visible page.
+              private void setupLockOverlay() {
+                  if (lockOverlay != null) return;
+                  LinearLayout overlay = new LinearLayout(this);
+                  overlay.setOrientation(LinearLayout.VERTICAL);
+                  overlay.setGravity(Gravity.CENTER);
+                  overlay.setBackgroundColor(Color.parseColor("#0b0518"));
+                  overlay.setVisibility(View.GONE);
+                  overlay.setClickable(true);
+                  overlay.setFocusable(true);
+
+                  TextView label = new TextView(this);
+                  label.setText("🔒\nለመቀጠል እባክዎ ይክፈቱ\nUnlock to continue");
+                  label.setTextColor(Color.WHITE);
+                  label.setGravity(Gravity.CENTER);
+                  label.setTextSize(16);
+                  label.setPadding(0, 0, 0, 32);
+                  overlay.addView(label);
+
+                  Button unlockButton = new Button(this);
+                  unlockButton.setText("Unlock");
+                  unlockButton.setOnClickListener(v -> showBiometricPrompt());
+                  overlay.addView(unlockButton);
+
+                  addContentView(overlay, new FrameLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT,
+                      ViewGroup.LayoutParams.MATCH_PARENT
+                  ));
+                  lockOverlay = overlay;
+              }
+
+              // Called from onResume when the idle-timeout has elapsed. Shows the
+              // overlay immediately (hiding page content) then prompts biometrics.
+              private void requireReAuthentication() {
+                  if (lockOverlayShowing || lockOverlay == null) return;
+                  lockOverlayShowing = true;
+                  lockOverlay.setVisibility(View.VISIBLE);
+                  showBiometricPrompt();
+              }
+
+              private void showBiometricPrompt() {
+                  try {
+                      BiometricManager biometricManager = BiometricManager.from(this);
+                      int canAuth = biometricManager.canAuthenticate(
+                          BiometricManager.Authenticators.BIOMETRIC_WEAK
+                              | BiometricManager.Authenticators.DEVICE_CREDENTIAL
+                      );
+                      if (canAuth != BiometricManager.BIOMETRIC_SUCCESS) {
+                          // No fingerprint/face/PIN/pattern set up on this device at all —
+                          // there is nothing to authenticate against, so don't trap the
+                          // student behind a lock screen they can never pass. Just let
+                          // them straight in.
+                          dismissLockOverlay();
+                          return;
+                      }
+
+                      BiometricPrompt.PromptInfo promptInfo = new BiometricPrompt.PromptInfo.Builder()
+                          .setTitle("RealVision Academy")
+                          .setSubtitle("ለመቀጠል ማንነትዎን ያረጋግጡ / Verify to continue")
+                          .setAllowedAuthenticators(
+                              BiometricManager.Authenticators.BIOMETRIC_WEAK
+                                  | BiometricManager.Authenticators.DEVICE_CREDENTIAL
+                          )
+                          .build();
+
+                      BiometricPrompt prompt = new BiometricPrompt(this, biometricExecutor,
+                          new BiometricPrompt.AuthenticationCallback() {
+                              @Override
+                              public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
+                                  runOnUiThread(MainActivity.this::dismissLockOverlay);
+                              }
+
+                              @Override
+                              public void onAuthenticationError(int errorCode, CharSequence errString) {
+                                  // Leaves the overlay up — student can retap "Unlock" to try
+                                  // again. Deliberately does NOT finish()/exit the app: a
+                                  // cancelled or failed prompt shouldn't force-close a
+                                  // student's session, just keep them at the lock screen.
+                              }
+                          });
+                      prompt.authenticate(promptInfo);
+                  } catch (Exception e) {
+                      // Biometric hardware/API unavailable for some reason — fail open
+                      // rather than permanently locking a student out of the app.
+                      e.printStackTrace();
+                      dismissLockOverlay();
+                  }
+              }
+
+              private void dismissLockOverlay() {
+                  lockOverlayShowing = false;
+                  if (lockOverlay != null) lockOverlay.setVisibility(View.GONE);
+              }
+
+              // ======================================================================
+              // 46: Pull-to-refresh (manual, no extra layout dependency needed)
+              // ======================================================================
+
+              private void setupPullIndicator() {
+                  ProgressBar spinner = new ProgressBar(this);
+                  spinner.setVisibility(View.GONE);
+                  float density = getResources().getDisplayMetrics().density;
+                  FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                      (int) (36 * density), (int) (36 * density)
+                  );
+                  params.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+                  params.topMargin = (int) (16 * density);
+                  addContentView(spinner, params);
+                  pullIndicator = spinner;
+              }
+
+              // Tracks a downward drag starting from the very top of the page (scrollY
+              // == 0) and, once it passes PULL_TRIGGER_DP, reloads the page on release
+              // — the same gesture students already know from Instagram/Twitter/Gmail.
+              // Deliberately ignores drags that don't start at scrollY == 0, so normal
+              // in-page scrolling is never intercepted or made to feel "sticky".
+              private void handlePullToRefreshTouch(WebView webView, MotionEvent event) {
+                  float density = getResources().getDisplayMetrics().density;
+                  switch (event.getActionMasked()) {
+                      case MotionEvent.ACTION_DOWN:
+                          pullStartY = event.getRawY();
+                          pullTracking = webView.getScrollY() == 0;
+                          break;
+                      case MotionEvent.ACTION_MOVE:
+                          if (!pullTracking || pullStartY < 0) break;
+                          float dy = event.getRawY() - pullStartY;
+                          if (dy > 0 && webView.getScrollY() == 0 && pullIndicator != null) {
+                              pullIndicator.setVisibility(View.VISIBLE);
+                              float progress = Math.min(dy / (PULL_TRIGGER_DP * density), 1f);
+                              pullIndicator.setAlpha(progress);
+                          }
+                          break;
+                      case MotionEvent.ACTION_UP:
+                      case MotionEvent.ACTION_CANCEL:
+                          if (pullTracking && pullStartY >= 0) {
+                              float dyFinal = event.getRawY() - pullStartY;
+                              if (dyFinal > PULL_TRIGGER_DP * density) {
+                                  vibrateShort();
+                                  webView.reload();
+                              }
+                          }
+                          if (pullIndicator != null) pullIndicator.setVisibility(View.GONE);
+                          pullTracking = false;
+                          pullStartY = -1f;
+                          break;
+                      default:
+                          break;
+                  }
+              }
+
+              // ======================================================================
+              // 47: Soft (dismissible, non-forced) update banner
+              // ======================================================================
+
+              private void setupSoftUpdateBanner() {
+                  LinearLayout banner = new LinearLayout(this);
+                  banner.setOrientation(LinearLayout.HORIZONTAL);
+                  banner.setGravity(Gravity.CENTER_VERTICAL);
+                  banner.setBackgroundColor(Color.parseColor("#1d4ed8"));
+                  float density = getResources().getDisplayMetrics().density;
+                  banner.setPadding((int) (16 * density), (int) (10 * density), (int) (16 * density), (int) (10 * density));
+                  banner.setVisibility(View.GONE);
+
+                  TextView text = new TextView(this);
+                  text.setText("አዲስ ስሪት አለ / New version available");
+                  text.setTextColor(Color.WHITE);
+                  text.setTextSize(13);
+                  LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(
+                      0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+                  );
+                  banner.addView(text, textParams);
+
+                  Button updateBtn = new Button(this);
+                  updateBtn.setText("Update");
+                  banner.addView(updateBtn);
+
+                  Button dismissBtn = new Button(this);
+                  dismissBtn.setText("✕");
+                  dismissBtn.setOnClickListener(v -> {
+                      vibrateShort();
+                      banner.setVisibility(View.GONE);
+                  });
+                  banner.addView(dismissBtn);
+
+                  FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT,
+                      ViewGroup.LayoutParams.WRAP_CONTENT
+                  );
+                  params.gravity = Gravity.BOTTOM;
+                  addContentView(banner, params);
+                  softUpdateBanner = banner;
+
+                  updateBtn.setOnClickListener(v -> {
+                      vibrateShort();
+                      Object tag = banner.getTag();
+                      String storeUrl = tag != null ? tag.toString()
+                          : "https://play.google.com/store/apps/details?id=" + getPackageName();
+                      try {
+                          startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(storeUrl)));
+                      } catch (Exception e) {
+                          e.printStackTrace();
+                      }
+                  });
+              }
+
+              private void showSoftUpdateBanner(String storeUrl) {
+                  if (softUpdateBanner == null) return;
+                  softUpdateBanner.setTag(storeUrl);
+                  softUpdateBanner.setVisibility(View.VISIBLE);
               }
           }
           JAVAEOF
@@ -1394,20 +1946,42 @@ jobs:
                   1
               )
 
-          # 31: Deep link intent-filter (web+realvision://), inserted only inside MainActivity's block,
-          # right before its closing </activity> tag, and only once.
+          # 45d: Biometric permissions for the app-lock feature. USE_BIOMETRIC covers
+          # API 28+; USE_FINGERPRINT is the older pre-28 equivalent some OEM devices
+          # still check. Both are normal-level (auto-granted, no runtime prompt).
+          if 'android.permission.USE_BIOMETRIC' not in content:
+              content = content.replace(
+                  '<application',
+                  '<uses-permission android:name="android.permission.USE_BIOMETRIC" />\n    <application',
+                  1
+              )
+          if 'android.permission.USE_FINGERPRINT' not in content:
+              content = content.replace(
+                  '<application',
+                  '<uses-permission android:name="android.permission.USE_FINGERPRINT" />\n    <application',
+                  1
+              )
+
+          # 31: Deep link intent-filter (web+realvision://) + 48c: app-shortcuts
+          # meta-data, both inserted only inside MainActivity's block, right before
+          # its closing </activity> tag, and only once each.
           def add_deep_link(match):
               block = match.group(0)
-              if 'web+realvision' in block:
-                  return block
-              deep_link_filter = '''        <intent-filter>
+              extra = ''
+              if 'web+realvision' not in block:
+                  extra += '''        <intent-filter>
               <action android:name="android.intent.action.VIEW" />
               <category android:name="android.intent.category.DEFAULT" />
               <category android:name="android.intent.category.BROWSABLE" />
               <data android:scheme="web+realvision" />
               </intent-filter>
-          </activity>'''
-              return re.sub(r'</activity>\s*$', deep_link_filter, block, count=1)
+          '''
+              if 'android.app.shortcuts' not in block:
+                  extra += '''        <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts" />
+          '''
+              if not extra:
+                  return block
+              return re.sub(r'</activity>\s*$', extra + '</activity>', block, count=1)
 
           content = re.sub(
               r'<activity[^>]*android:name="\.MainActivity".*?</activity>',
