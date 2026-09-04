@@ -2138,7 +2138,16 @@ jobs:
               }
           '''
 
-          if 'signingConfigs' not in content:
+          # Bug fix (block never inserted): checking bare 'signingConfigs' here used to
+          # false-positive once the release_type edit above ran first — that edit's own
+          # text contains "signingConfig signingConfigs.release", which already contains
+          # the substring "signingConfigs", so this guard thought the block already
+          # existed and silently skipped adding it. signingConfigs.release was then
+          # referenced by buildTypes.release but never actually defined, which is exactly
+          # what Gradle's "Could not get unknown property 'release' for SigningConfig
+          # container" means. Checking for the block's opening brace specifically avoids
+          # matching that unrelated reference.
+          if 'signingConfigs {' not in content:
               content = re.sub(
                   r'(android\s*\{)',
                   r'\1' + signing_block,
