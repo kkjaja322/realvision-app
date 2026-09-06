@@ -938,29 +938,66 @@ jobs:
                       if (!isNetworkAvailable()) {
                           Toast.makeText(this, "የኢንተርኔት ግንኙነት የለም / No internet connection", Toast.LENGTH_LONG).show();
                       }
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
 
-                      // 32: Telegram-style network status banner
+                  // Bug fix (banner/VPN/update/rating/lock/shortcut features never firing
+                  // on some devices, with no visible error): everything above shared ONE
+                  // try block with everything below. If anything earlier in that block
+                  // threw — and there's a lot of complex, device-dependent code up there
+                  // (custom WebViewClient, JS interfaces, native offline cache, etc.) —
+                  // execution jumped straight to the catch and every feature below (the
+                  // network status banner, VPN detection, force-update check, rating
+                  // prompt, biometric lock, app-shortcut handling) silently never ran.
+                  // The exception was only ever printStackTrace()'d, invisible outside a
+                  // debugger, so from the student's side these features simply didn't
+                  // exist, with nothing in the UI to explain why. Giving each one its own
+                  // try/catch means a failure in any single feature — including the
+                  // WebView setup above — can no longer take the rest down with it.
+
+                  // 32: Telegram-style network status banner
+                  try {
                       setupNetworkBanner();
-
                       // 33: Real-internet (package/data) check, polled periodically
                       connectivityHandler.post(periodicConnectivityCheck);
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
 
-                      // 34: VPN detection on launch
+                  // 34: VPN detection on launch
+                  try {
                       checkVpnAndPrompt();
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
 
-                      // 37: Force-update check against remote version JSON
+                  // 37: Force-update check against remote version JSON
+                  try {
                       checkForForceUpdate();
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
 
-                      // 38: App-rating prompt after a few launches
+                  // 38: App-rating prompt after a few launches
+                  try {
                       maybePromptRating();
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
 
-                      // 45a: Prepare (hidden) the biometric lock overlay used by the
-                      // session-timeout check in onResume below.
+                  // 45a: Prepare (hidden) the biometric lock overlay used by the
+                  // session-timeout check in onResume below.
+                  try {
                       setupLockOverlay();
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
 
-                      // 48: Handle a tap on a long-press app shortcut (e.g. "Quiz") that
-                      // cold-started the app — jumps straight to that shortcut's URL
-                      // instead of the default dashboard gateway.
+                  // 48: Handle a tap on a long-press app shortcut (e.g. "Quiz") that
+                  // cold-started the app — jumps straight to that shortcut's URL instead
+                  // of the default dashboard gateway.
+                  try {
                       handleShortcutIntent(getIntent());
                   } catch (Exception e) {
                       e.printStackTrace();
