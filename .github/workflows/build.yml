@@ -359,7 +359,22 @@ jobs:
               // (on launch, every 10s, and on every network change), so it's more reliable
               // than the instantaneous isNetworkAvailable() check alone (that one only knows
               // "connected to a network", not "that network actually reaches the internet").
-              private volatile boolean hasRealInternetSignal = true;
+              //
+              // Bug fix (connected banner never appeared): this used to default to true.
+              // checkRealInternet() only flashes the "3G - 230 KB/s - CONNECTED" banner
+              // when it detects a transition FROM offline TO online (wasOffline = true).
+              // Starting this at true meant a completely normal cold start — phone already
+              // on working WiFi/data, the most common case — looked exactly like "was
+              // already online", so wasOffline was false on the very first check and the
+              // confirmation banner silently never showed, on every launch, for every
+              // student who wasn't currently offline. Starting at false instead means the
+              // very first real check always correctly reads as "just came online" and
+              // shows the banner once. periodicConnectivityCheck below is posted
+              // immediately in onCreate (not delayed), so this resolves within a fraction
+              // of a second of app start — not long enough for the temporarily-false value
+              // to incorrectly trigger the offline-navigation block in
+              // shouldOverrideUrlLoading in practice.
+              private volatile boolean hasRealInternetSignal = false;
               private final Runnable periodicConnectivityCheck = new Runnable() {
                   @Override
                   public void run() {
@@ -711,15 +726,50 @@ jobs:
                                   Uri uri = request.getUrl();
                                   String host = uri.getHost();
                                   boolean isLiveDomain = host != null && host.endsWith("realvisionacademy.site.je");
+
+                                  // Bug fix (privacy — offline cache leaked between accounts on a
+                                  // shared device): offlineCacheKey(url) only ever hashed the URL
+                                  // itself, never who was logged in. Since student-specific pages
+                                  // (dashboard, my_notes, wallet, profile, ...) all live at the
+                                  // SAME url for every student, a phone shared between siblings/
+                                  // classmates would keep serving the PREVIOUS student's cached
+                                  // page to the next one whenever offline. The site's logout
+                                  // button calls index.php?action=logout as a plain GET fetch()
+                                  // (not a navigation, so this runs even though it isn't a
+                                  // main-frame request) — catching it here and wiping the native
+                                  // cache + "last successfully viewed page" pointer means the next
+                                  // person who opens the app offline gets nothing stale to see
+                                  // instead of a previous student's private data.
+                                  if (isLiveDomain && "GET".equalsIgnoreCase(request.getMethod())
+                                          && uri.toString().contains("action=logout")) {
+                                      clearOfflineCacheForAccountSwitch();
+                                  }
+
                                   if (!request.isForMainFrame() || !isLiveDomain || !"GET".equalsIgnoreCase(request.getMethod())) {
                                       return super.shouldInterceptRequest(view, request);
                                   }
                                   String urlStr = uri.toString();
                                   HttpURLConnection conn = null;
+                                  // 32e: Timed from just before the connection opens to just
+                                  // after the full body is read, so it captures the whole
+                                  // real-world experience (connect + headers + download) —
+                                  // used below to show the student an actual measured speed
+                                  // instead of just a generic "online" message.
+                                  long fetchStartedAtMs = System.currentTimeMillis();
                                   try {
                                       conn = (HttpURLConnection) new URL(urlStr).openConnection();
-                                      conn.setConnectTimeout(8000);
-                                      conn.setReadTimeout(12000);
+                                      // Bug fix (low/weak internet mistaken for "offline"): 8s
+                                      // connect / 12s read was tuned for a normal connection.
+                                      // On slow-but-working 2G/EDGE (common on school WiFi and
+                                      // rural SIM data), a full page can legitimately take longer
+                                      // than that to arrive, so this used to throw a
+                                      // SocketTimeoutException and fall through to the offline
+                                      // fallback/cache path even though the network genuinely
+                                      // worked — it just needed more time. Widened so a slow
+                                      // connection gets a real chance to finish before we give up
+                                      // and treat it as offline.
+                                      conn.setConnectTimeout(15000);
+                                      conn.setReadTimeout(25000);
                                       // Bug fix (URL/WebView mismatch): this used to be
                                       // setInstanceFollowRedirects(true). That made HttpURLConnection
                                       // silently chase a server-side redirect (e.g.
@@ -795,6 +845,23 @@ jobs:
                                           offlineCachePut(urlStr, mime, data);
                                           getSharedPreferences("realvision_prefs", MODE_PRIVATE)
                                               .edit().putString("last_page_url", urlStr).apply();
+
+                                          // 32f: Real, measured page-load speed (bytes actually
+                                          // downloaded / time actually taken), refreshed on every
+                                          // successful page — more meaningful to a student than the
+                                          // OS's own rough bandwidth estimate, since it reflects
+                                          // exactly what just happened on screen. Only updates the
+                                          // stored label; it doesn't show the banner itself here so
+                                          // normal fast browsing stays quiet — checkRealInternet()'s
+                                          // reconnect flash and the flight-mode/offline/package
+                                          // banners are still the only things students see pop up
+                                          // uninvited, per the existing Telegram-style "quiet unless
+                                          // something's wrong (or just came back)" design.
+                                          long elapsedMs = System.currentTimeMillis() - fetchStartedAtMs;
+                                          if (elapsedMs > 0 && data.length > 0) {
+                                              double kbPerSec = (data.length / 1024.0) / (elapsedMs / 1000.0);
+                                              lastMeasuredSpeedLabel = Math.round(kbPerSec) + " KB/s";
+                                          }
                                       }
                                       return new WebResourceResponse(mime, "UTF-8", new ByteArrayInputStream(data));
                                   } catch (Exception e) {
@@ -967,6 +1034,25 @@ jobs:
                   }
               }
 
+              // Wipes every cached page/asset plus the "last page" pointer used by the
+              // cold-start fallback — called on logout so the next person to use this
+              // device (or this same student logging into a different account) never
+              // sees someone else's cached offline content. Safe to call even if
+              // nothing is cached yet.
+              private void clearOfflineCacheForAccountSwitch() {
+                  try {
+                      File dir = offlineCacheDir();
+                      File[] files = dir.listFiles();
+                      if (files != null) {
+                          for (File f : files) f.delete();
+                      }
+                      getSharedPreferences("realvision_prefs", MODE_PRIVATE)
+                          .edit().remove("last_page_url").apply();
+                  } catch (Exception e) {
+                      // Non-fatal — worst case a stale cache lingers until it's overwritten
+                  }
+              }
+
               private void offlineCachePut(String url, String mime, byte[] data) {
                   try {
                       String key = offlineCacheKey(url);
@@ -1056,8 +1142,13 @@ jobs:
                   HttpURLConnection conn = null;
                   try {
                       conn = (HttpURLConnection) new URL(urlStr).openConnection();
-                      conn.setConnectTimeout(8000);
-                      conn.setReadTimeout(12000);
+                      // This runs in the background (auto-sync / download-all), not while
+                      // a student is staring at a spinner, so it can afford to be even
+                      // more patient than the live navigation path above on a weak
+                      // connection — better to take longer than to give up and leave a
+                      // page un-cached.
+                      conn.setConnectTimeout(15000);
+                      conn.setReadTimeout(30000);
                       conn.setInstanceFollowRedirects(true);
                       String cookie = CookieManager.getInstance().getCookie(urlStr);
                       if (cookie != null) conn.setRequestProperty("Cookie", cookie);
@@ -1376,8 +1467,20 @@ jobs:
                   new Thread(() -> {
                       boolean hasRealInternet;
                       try {
+                          // Bug fix (low/weak internet mistaken for "offline"): this used to
+                          // probe google.com with a 2.5s timeout. Two problems on a weak or
+                          // school/rural connection: (1) 2.5s is often not enough time for a
+                          // TCP handshake to complete on slow 2G/EDGE even though the
+                          // connection does work, so hasRealInternetSignal flipped to false
+                          // and the app blocked navigation / showed "Connecting..." forever
+                          // even when it could actually reach the server; (2) google.com
+                          // isn't necessarily reachable or fast from every network even when
+                          // the app's OWN server is — the only connectivity that actually
+                          // matters here is whether realvisionacademy.site.je is reachable.
+                          // Probing the real server directly, with a longer timeout, means a
+                          // slow-but-working connection is correctly recognized as online.
                           java.net.Socket socket = new java.net.Socket();
-                          socket.connect(new java.net.InetSocketAddress("google.com", 443), 2500);
+                          socket.connect(new java.net.InetSocketAddress("realvisionacademy.site.je", 443), 6000);
                           socket.close();
                           hasRealInternet = true;
                       } catch (Exception e) {
@@ -1395,14 +1498,17 @@ jobs:
                           } else if (!isNetworkAvailable()) {
                               setBanner(BANNER_OFFLINE, true);
                           } else if (!result) {
-                              // Weak signal / exhausted data package — stay on "Connecting..."
-                              // rather than a technical "check your package" message.
-                              setBanner(BANNER_CONNECTING, true);
+                              // New: distinguish mobile-data-but-no-package from a WiFi
+                              // network that's simply slow/negotiating a captive portal —
+                              // "check your package" is only meaningful advice on cellular.
+                              setBanner(isActiveTransportCellular() ? BANNER_CHECK_PACKAGE : BANNER_CONNECTING, true);
                           } else if (wasOffline) {
                               // Internet just came back — show a brief confirmation instead of
                               // silently hiding the banner, then fade it out on its own after a
-                              // couple of seconds (Telegram/WhatsApp-style).
-                              setBanner(BANNER_ONLINE, true);
+                              // couple of seconds (Telegram/WhatsApp-style). Now includes the
+                              // network type and, once at least one page has loaded this
+                              // session, a real measured speed (e.g. "3G - 230 KB/s - CONNECTED").
+                              setBanner(getConnectedBannerText(), true);
                               bannerHandler.postDelayed(() -> setBanner(null, false), 1800);
                           } else {
                               setBanner(null, false);
@@ -1546,18 +1652,76 @@ jobs:
                   }
               }
 
-              // 32a: Top banner text — one source of truth for all four states, used
+              // 32a: Top banner text — one source of truth for all five states, used
               // by checkRealInternet(), shouldOverrideUrlLoading, and the
               // ConnectivityManager.NetworkCallback below, so the wording never drifts
               // out of sync between call sites.
-              //   1. Flight mode ON                              -> BANNER_FLIGHT_MODE
+              //   1. Flight mode ON                                        -> BANNER_FLIGHT_MODE
               //   2. Flight mode OFF, no active network (data/WiFi both off) -> BANNER_OFFLINE
-              //   3. Network active but no real internet (weak signal / 0 data package) -> BANNER_CONNECTING
-              //   4. Everything working (real internet confirmed)  -> BANNER_ONLINE (flashed briefly, then hidden)
-              private static final String BANNER_FLIGHT_MODE = "FLIGHT MODE IS ON, TURN IT OFF TO CONTINUE";
+              //   3. Mobile data ON but no real internet (package/balance likely out) -> BANNER_CHECK_PACKAGE
+              //   4. WiFi ON but no real internet (weak signal / captive portal) -> BANNER_CONNECTING
+              //   5. Everything working (real internet confirmed) -> getConnectedBannerText() (flashed briefly, then hidden)
+              private static final String BANNER_FLIGHT_MODE = "YOU TURNED ON FLIGHT MODE";
               private static final String BANNER_OFFLINE = "YOU ARE OFFLINE, SOME FEATURES DOES NOT WORK";
               private static final String BANNER_CONNECTING = "Connecting...";
-              private static final String BANNER_ONLINE = "YOU ARE ONLINE";
+              private static final String BANNER_CHECK_PACKAGE = "YOU TURNED ON YOUR DATA BUT CHECK YOUR PACKAGE";
+
+              // 32g: Real, measured KB/s from the most recently completed page load (see
+              // shouldInterceptRequest's success branch above) — null until at least one
+              // page has loaded this session, in which case the reconnect banner below
+              // falls back to just the network type with no speed number attached.
+              private volatile String lastMeasuredSpeedLabel = null;
+
+              private boolean isActiveTransportCellular() {
+                  try {
+                      ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                      if (cm == null) return false;
+                      Network network = cm.getActiveNetwork();
+                      NetworkCapabilities caps = network != null ? cm.getNetworkCapabilities(network) : null;
+                      return caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR);
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+
+              // 32h: "WiFi" / "2G" / "3G" / "4G" / "5G" label for the top banner. Reading
+              // the phone's REAL cellular generation (TelephonyManager.getDataNetworkType())
+              // needs the READ_PHONE_STATE runtime permission on Android 10+ — not worth
+              // prompting students for just to label a banner — so this buckets the OS's
+              // own (permission-free) estimated link bandwidth instead.
+              private String getActiveNetworkTypeLabel() {
+                  try {
+                      ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                      if (cm == null) return "Network";
+                      Network network = cm.getActiveNetwork();
+                      NetworkCapabilities caps = network != null ? cm.getNetworkCapabilities(network) : null;
+                      if (caps == null) return "Network";
+                      if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return "WiFi";
+                      if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                          int kbps = caps.getLinkDownstreamBandwidthKbps();
+                          if (kbps <= 0) return "Mobile Data";
+                          if (kbps < 400) return "2G";
+                          if (kbps < 4000) return "3G";
+                          if (kbps < 20000) return "4G";
+                          return "5G";
+                      }
+                      return "Network";
+                  } catch (Exception e) {
+                      return "Network";
+                  }
+              }
+
+              // 32i: The reconnect banner text — network type plus the most recent REAL
+              // measured speed if we have one yet (e.g. "3G - 230 KB/s - CONNECTED"),
+              // falling back to just the type on the very first connection of the session
+              // before any page has finished loading.
+              private String getConnectedBannerText() {
+                  String type = getActiveNetworkTypeLabel();
+                  if (lastMeasuredSpeedLabel != null) {
+                      return type + " - " + lastMeasuredSpeedLabel + " - CONNECTED";
+                  }
+                  return type + " - CONNECTED";
+              }
 
               // 32b: True only when the device's Airplane/Flight mode toggle itself is on
               // — distinct from "just no active network", so the banner can tell the
